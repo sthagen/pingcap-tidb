@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/opentracing/opentracing-go"
@@ -68,7 +69,11 @@ type tikvSnapshot struct {
 	// cached use len(value)=0 to represent a key-value entry doesn't exist (a reliable truth from TiKV).
 	// In the BatchGet API, it use no key-value entry to represent non-exist.
 	// It's OK as long as there are no zero-byte values in the protocol.
-	cached map[string][]byte
+	mu struct {
+		sync.RWMutex
+		hitCnt int64
+		cached map[string][]byte
+	}
 }
 
 // newTiKVSnapshot creates a snapshot of an TiKV store.
@@ -88,7 +93,9 @@ func newTiKVSnapshot(store *tikvStore, ver kv.Version, replicaReadSeed uint32) *
 func (s *tikvSnapshot) setSnapshotTS(ts uint64) {
 	// Invalidate cache if the snapshotTS change!
 	s.version.Ver = ts
-	s.cached = nil
+	s.mu.Lock()
+	s.mu.cached = nil
+	s.mu.Unlock()
 	// And also the minCommitTS pushed information.
 	s.minCommitTSPushed.data = make(map[uint64]struct{}, 5)
 }
@@ -98,10 +105,12 @@ func (s *tikvSnapshot) setSnapshotTS(ts uint64) {
 func (s *tikvSnapshot) BatchGet(ctx context.Context, keys []kv.Key) (map[string][]byte, error) {
 	// Check the cached value first.
 	m := make(map[string][]byte)
-	if s.cached != nil {
+	s.mu.RLock()
+	if s.mu.cached != nil {
 		tmp := keys[:0]
 		for _, key := range keys {
-			if val, ok := s.cached[string(key)]; ok {
+			if val, ok := s.mu.cached[string(key)]; ok {
+				atomic.AddInt64(&s.mu.hitCnt, 1)
 				if len(val) > 0 {
 					m[string(key)] = val
 				}
@@ -111,6 +120,7 @@ func (s *tikvSnapshot) BatchGet(ctx context.Context, keys []kv.Key) (map[string]
 		}
 		keys = tmp
 	}
+	s.mu.RUnlock()
 
 	if len(keys) == 0 {
 		return m, nil
@@ -119,7 +129,7 @@ func (s *tikvSnapshot) BatchGet(ctx context.Context, keys []kv.Key) (map[string]
 	// We want [][]byte instead of []kv.Key, use some magic to save memory.
 	bytesKeys := *(*[][]byte)(unsafe.Pointer(&keys))
 	ctx = context.WithValue(ctx, txnStartKey, s.version.Ver)
-	bo := NewBackoffer(ctx, batchGetMaxBackoff).WithVars(s.vars)
+	bo := NewBackofferWithVars(ctx, batchGetMaxBackoff, s.vars)
 
 	// Create a map to collect key-values from region servers.
 	var mu sync.Mutex
@@ -142,12 +152,14 @@ func (s *tikvSnapshot) BatchGet(ctx context.Context, keys []kv.Key) (map[string]
 	}
 
 	// Update the cache.
-	if s.cached == nil {
-		s.cached = make(map[string][]byte, len(m))
+	s.mu.Lock()
+	if s.mu.cached == nil {
+		s.mu.cached = make(map[string][]byte, len(m))
 	}
 	for _, key := range keys {
-		s.cached[string(key)] = m[string(key)]
+		s.mu.cached[string(key)] = m[string(key)]
 	}
+	s.mu.Unlock()
 
 	return m, nil
 }
@@ -226,7 +238,7 @@ func (s *tikvSnapshot) batchGetSingleRegion(bo *Backoffer, batch batchKeys, coll
 		req := tikvrpc.NewReplicaReadRequest(tikvrpc.CmdBatchGet, &pb.BatchGetRequest{
 			Keys:    pending,
 			Version: s.version.Ver,
-		}, s.replicaRead, s.replicaReadSeed, pb.Context{
+		}, s.replicaRead, &s.replicaReadSeed, pb.Context{
 			Priority:     s.priority,
 			NotFillCache: s.notFillCache,
 			TaskId:       s.taskID,
@@ -297,7 +309,7 @@ func (s *tikvSnapshot) Get(ctx context.Context, k kv.Key) ([]byte, error) {
 	}
 
 	ctx = context.WithValue(ctx, txnStartKey, s.version.Ver)
-	val, err := s.get(NewBackoffer(ctx, getMaxBackoff), k)
+	val, err := s.get(NewBackofferWithVars(ctx, getMaxBackoff, s.vars), k)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -314,11 +326,15 @@ func (s *tikvSnapshot) Get(ctx context.Context, k kv.Key) ([]byte, error) {
 
 func (s *tikvSnapshot) get(bo *Backoffer, k kv.Key) ([]byte, error) {
 	// Check the cached values first.
-	if s.cached != nil {
-		if value, ok := s.cached[string(k)]; ok {
+	s.mu.RLock()
+	if s.mu.cached != nil {
+		if value, ok := s.mu.cached[string(k)]; ok {
+			atomic.AddInt64(&s.mu.hitCnt, 1)
+			s.mu.RUnlock()
 			return value, nil
 		}
 	}
+	s.mu.RUnlock()
 
 	failpoint.Inject("snapshot-get-cache-fail", func(_ failpoint.Value) {
 		if bo.ctx.Value("TestSnapshotCache") != nil {
@@ -338,7 +354,7 @@ func (s *tikvSnapshot) get(bo *Backoffer, k kv.Key) ([]byte, error) {
 		&pb.GetRequest{
 			Key:     k,
 			Version: s.version.Ver,
-		}, s.replicaRead, s.replicaReadSeed, pb.Context{
+		}, s.replicaRead, &s.replicaReadSeed, pb.Context{
 			Priority:     s.priority,
 			NotFillCache: s.notFillCache,
 			TaskId:       s.taskID,
@@ -420,6 +436,15 @@ func (s *tikvSnapshot) DelOption(opt kv.Option) {
 	case kv.ReplicaRead:
 		s.replicaRead = kv.ReplicaReadLeader
 	}
+}
+
+// SnapCacheHitCount gets the snapshot cache hit count.
+func SnapCacheHitCount(snap kv.Snapshot) int {
+	tikvSnap, ok := snap.(*tikvSnapshot)
+	if !ok {
+		return 0
+	}
+	return int(atomic.LoadInt64(&tikvSnap.mu.hitCnt))
 }
 
 func extractLockFromKeyErr(keyErr *pb.KeyError) (*Lock, error) {

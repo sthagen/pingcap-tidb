@@ -188,14 +188,17 @@ server-version = "test_version"
 repair-mode = true
 max-server-connections = 200
 mem-quota-query = 10000
+nested-loop-join-cache-capacity = 100
 max-index-length = 3080
 [performance]
 txn-total-size-limit=2000
 [tikv-client]
 commit-timeout="41s"
+enable-async-commit=true
 max-batch-size=128
 region-cache-ttl=6000
 store-limit=0
+ttl-refreshed-txn-size=8192
 [stmt-summary]
 enable=false
 enable-internal-query=true
@@ -204,7 +207,6 @@ max-sql-length=1024
 refresh-interval=100
 history-size=100
 [experimental]
-allow-auto-random = true
 allow-expression-index = true
 [isolation-read]
 engines = ["tiflash"]
@@ -226,9 +228,11 @@ engines = ["tiflash"]
 	c.Assert(conf.AlterPrimaryKey, Equals, true)
 
 	c.Assert(conf.TiKVClient.CommitTimeout, Equals, "41s")
+	c.Assert(conf.TiKVClient.EnableAsyncCommit, Equals, true)
 	c.Assert(conf.TiKVClient.MaxBatchSize, Equals, uint(128))
 	c.Assert(conf.TiKVClient.RegionCacheTTL, Equals, uint(6000))
 	c.Assert(conf.TiKVClient.StoreLimit, Equals, int64(0))
+	c.Assert(conf.TiKVClient.TTLRefreshedTxnSize, Equals, int64(8192))
 	c.Assert(conf.TokenLimit, Equals, uint(1000))
 	c.Assert(conf.EnableTableLock, IsTrue)
 	c.Assert(conf.DelayCleanTableLock, Equals, uint64(5))
@@ -243,8 +247,8 @@ engines = ["tiflash"]
 	c.Assert(conf.RepairMode, Equals, true)
 	c.Assert(conf.MaxServerConnections, Equals, uint32(200))
 	c.Assert(conf.MemQuotaQuery, Equals, int64(10000))
+	c.Assert(conf.NestedLoopJoinCacheCapacity, Equals, int64(100))
 	c.Assert(conf.Experimental.AllowsExpressionIndex, IsTrue)
-	c.Assert(conf.Experimental.AllowAutoRandom, IsTrue)
 	c.Assert(conf.IsolationRead.Engines, DeepEquals, []string{"tiflash"})
 	c.Assert(conf.MaxIndexLength, Equals, 3080)
 
@@ -255,6 +259,30 @@ log-rotate = true`)
 	err = conf.Load(configFile)
 	tmp := err.(*ErrConfigValidationFailed)
 	c.Assert(isAllDeprecatedConfigItems(tmp.UndecodedItems), IsTrue)
+
+	// Test telemetry config default value and whether it will be overwritten.
+	conf = NewConfig()
+	f.Truncate(0)
+	f.Seek(0, 0)
+	c.Assert(f.Sync(), IsNil)
+	c.Assert(conf.Load(configFile), IsNil)
+	c.Assert(conf.EnableTelemetry, Equals, true)
+
+	_, err = f.WriteString(`
+enable-table-lock = true
+`)
+	c.Assert(err, IsNil)
+	c.Assert(f.Sync(), IsNil)
+	c.Assert(conf.Load(configFile), IsNil)
+	c.Assert(conf.EnableTelemetry, Equals, true)
+
+	_, err = f.WriteString(`
+enable-telemetry = false
+`)
+	c.Assert(err, IsNil)
+	c.Assert(f.Sync(), IsNil)
+	c.Assert(conf.Load(configFile), IsNil)
+	c.Assert(conf.EnableTelemetry, Equals, false)
 
 	c.Assert(f.Close(), IsNil)
 	c.Assert(os.Remove(configFile), IsNil)
@@ -386,19 +414,6 @@ func (s *testConfigSuite) TestTxnTotalSizeLimitValid(c *C) {
 		conf.Performance.TxnTotalSizeLimit = tt.limit
 		c.Assert(conf.Valid() == nil, Equals, tt.valid)
 	}
-}
-
-func (s *testConfigSuite) TestAllowAutoRandomValid(c *C) {
-	conf := NewConfig()
-	checkValid := func(allowAlterPK, allowAutoRand, shouldBeValid bool) {
-		conf.AlterPrimaryKey = allowAlterPK
-		conf.Experimental.AllowAutoRandom = allowAutoRand
-		c.Assert(conf.Valid() == nil, Equals, shouldBeValid)
-	}
-	checkValid(true, true, false)
-	checkValid(true, false, true)
-	checkValid(false, true, true)
-	checkValid(false, false, true)
 }
 
 func (s *testConfigSuite) TestPreparePlanCacheValid(c *C) {
