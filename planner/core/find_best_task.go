@@ -210,6 +210,7 @@ func (p *baseLogicalPlan) enumeratePhysicalPlans4Task(physicalPlans []PhysicalPl
 		// The curCntPlan records the number of possible plans for pp
 		curCntPlan = 1
 		TimeStampNow := p.GetlogicalTS4TaskMap()
+		savedPlanID := p.ctx.GetSessionVars().PlanID
 		for j, child := range p.children {
 			childTask, cnt, err := child.findBestTask(pp.GetChildReqProps(j), &PlanCounterDisabled)
 			childCnts[j] = cnt
@@ -230,6 +231,7 @@ func (p *baseLogicalPlan) enumeratePhysicalPlans4Task(physicalPlans []PhysicalPl
 
 		// If the target plan can be found in this physicalPlan(pp), rebuild childTasks to build the corresponding combination.
 		if planCounter.IsForce() && int64(*planCounter) <= curCntPlan {
+			p.ctx.GetSessionVars().PlanID = savedPlanID
 			curCntPlan = int64(*planCounter)
 			err := p.rebuildChildTasks(&childTasks, pp, childCnts, int64(*planCounter), TimeStampNow)
 			if err != nil {
@@ -457,11 +459,27 @@ func compareCandidates(lhs, rhs *candidatePath) int {
 
 func (ds *DataSource) getTableCandidate(path *util.AccessPath, prop *property.PhysicalProperty) *candidatePath {
 	candidate := &candidatePath{path: path}
-	pkCol := ds.getPKIsHandleCol()
-	if len(prop.Items) == 1 && pkCol != nil {
-		candidate.isMatchProp = prop.Items[0].Col.Equal(nil, pkCol)
-		if path.StoreType == kv.TiFlash {
-			candidate.isMatchProp = candidate.isMatchProp && !prop.Items[0].Desc
+	if path.IsIntHandlePath {
+		pkCol := ds.getPKIsHandleCol()
+		if len(prop.Items) == 1 && pkCol != nil {
+			candidate.isMatchProp = prop.Items[0].Col.Equal(nil, pkCol)
+			if path.StoreType == kv.TiFlash {
+				candidate.isMatchProp = candidate.isMatchProp && !prop.Items[0].Desc
+			}
+		}
+	} else {
+		all, _ := prop.AllSameOrder()
+		// When the prop is empty or `all` is false, `isMatchProp` is better to be `false` because
+		// it needs not to keep order for index scan.
+		if !prop.IsEmpty() && all {
+			for i, col := range path.IdxCols {
+				if col.Equal(nil, prop.Items[0].Col) {
+					candidate.isMatchProp = matchIndicesProp(path.IdxCols[i:], path.IdxColLens[i:], prop.Items)
+					break
+				} else if i >= path.EqCondCount {
+					break
+				}
+			}
 		}
 	}
 	candidate.columnSet = expression.ExtractColumnSet(path.AccessConds)
