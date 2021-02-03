@@ -37,7 +37,6 @@ import (
 	"github.com/pingcap/tidb/domain/infosync"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/session"
-	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/mockoracle"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/store/mockstore/cluster"
@@ -241,30 +240,29 @@ func (s *testGCWorkerSuite) TestMinStartTS(c *C) {
 	spkv := s.store.GetSafePointKV()
 	err := spkv.Put(fmt.Sprintf("%s/%s", infosync.ServerMinStartTSPath, "a"), strconv.FormatUint(math.MaxUint64, 10))
 	c.Assert(err, IsNil)
-	now := time.Now()
-	sp := s.gcWorker.calSafePointByMinStartTS(ctx, now)
-	c.Assert(sp.Second(), Equals, now.Second())
+	now := oracle.GoTimeToTS(time.Now())
+	sp := s.gcWorker.calcSafePointByMinStartTS(ctx, now)
+	c.Assert(sp, Equals, now)
 	err = spkv.Put(fmt.Sprintf("%s/%s", infosync.ServerMinStartTSPath, "a"), "0")
 	c.Assert(err, IsNil)
-	sp = s.gcWorker.calSafePointByMinStartTS(ctx, now)
-	zeroTime := time.Unix(0, oracle.ExtractPhysical(0)*1e6)
-	c.Assert(sp, Equals, zeroTime)
+	sp = s.gcWorker.calcSafePointByMinStartTS(ctx, now)
+	c.Assert(sp, Equals, uint64(0))
 
 	err = spkv.Put(fmt.Sprintf("%s/%s", infosync.ServerMinStartTSPath, "a"), "0")
 	c.Assert(err, IsNil)
 	err = spkv.Put(fmt.Sprintf("%s/%s", infosync.ServerMinStartTSPath, "b"), "1")
 	c.Assert(err, IsNil)
-	sp = s.gcWorker.calSafePointByMinStartTS(ctx, now)
-	c.Assert(sp, Equals, zeroTime)
+	sp = s.gcWorker.calcSafePointByMinStartTS(ctx, now)
+	c.Assert(sp, Equals, uint64(0))
 
 	err = spkv.Put(fmt.Sprintf("%s/%s", infosync.ServerMinStartTSPath, "a"),
-		strconv.FormatUint(variable.GoTimeToTS(now), 10))
+		strconv.FormatUint(now, 10))
 	c.Assert(err, IsNil)
 	err = spkv.Put(fmt.Sprintf("%s/%s", infosync.ServerMinStartTSPath, "b"),
-		strconv.FormatUint(variable.GoTimeToTS(now.Add(-20*time.Second)), 10))
+		strconv.FormatUint(now-oracle.EncodeTSO(20000), 10))
 	c.Assert(err, IsNil)
-	sp = s.gcWorker.calSafePointByMinStartTS(ctx, now.Add(-10*time.Second))
-	c.Assert(sp.Second(), Equals, now.Add(-20*time.Second).Second())
+	sp = s.gcWorker.calcSafePointByMinStartTS(ctx, now-oracle.EncodeTSO(10000))
+	c.Assert(sp, Equals, now-oracle.EncodeTSO(20000))
 }
 
 func (s *testGCWorkerSuite) TestPrepareGC(c *C) {
@@ -378,6 +376,19 @@ func (s *testGCWorkerSuite) TestPrepareGC(c *C) {
 	useAutoConcurrency, err = s.gcWorker.checkUseAutoConcurrency()
 	c.Assert(err, IsNil)
 	c.Assert(useAutoConcurrency, IsTrue)
+
+	// Check skipping GC if safe point is not changed.
+	safePointTime, err := s.gcWorker.loadTime(gcSafePointKey)
+	minStartTS := oracle.GoTimeToTS(*safePointTime) + 1
+	c.Assert(err, IsNil)
+	spkv := s.store.GetSafePointKV()
+	err = spkv.Put(fmt.Sprintf("%s/%s", infosync.ServerMinStartTSPath, "a"), strconv.FormatUint(minStartTS, 10))
+	c.Assert(err, IsNil)
+	s.oracle.AddOffset(time.Minute * 40)
+	ok, safepoint, err := s.gcWorker.prepare()
+	c.Assert(err, IsNil)
+	c.Assert(ok, IsFalse)
+	c.Assert(safepoint, Equals, uint64(0))
 }
 
 func (s *testGCWorkerSuite) TestDoGCForOneRegion(c *C) {
@@ -487,23 +498,24 @@ func (s *testGCWorkerSuite) TestCheckGCMode(c *C) {
 func (s *testGCWorkerSuite) TestCheckScanLockMode(c *C) {
 	usePhysical, err := s.gcWorker.checkUsePhysicalScanLock()
 	c.Assert(err, IsNil)
+	c.Assert(usePhysical, Equals, false)
 	c.Assert(usePhysical, Equals, gcScanLockModeDefault == gcScanLockModePhysical)
 	// Now the row must be set to the default value.
 	str, err := s.gcWorker.loadValueFromSysTable(gcScanLockModeKey)
 	c.Assert(err, IsNil)
 	c.Assert(str, Equals, gcScanLockModeDefault)
 
-	err = s.gcWorker.saveValueToSysTable(gcScanLockModeKey, gcScanLockModeLegacy)
-	c.Assert(err, IsNil)
-	usePhysical, err = s.gcWorker.checkUsePhysicalScanLock()
-	c.Assert(err, IsNil)
-	c.Assert(usePhysical, Equals, false)
-
 	err = s.gcWorker.saveValueToSysTable(gcScanLockModeKey, gcScanLockModePhysical)
 	c.Assert(err, IsNil)
 	usePhysical, err = s.gcWorker.checkUsePhysicalScanLock()
 	c.Assert(err, IsNil)
 	c.Assert(usePhysical, Equals, true)
+
+	err = s.gcWorker.saveValueToSysTable(gcScanLockModeKey, gcScanLockModeLegacy)
+	c.Assert(err, IsNil)
+	usePhysical, err = s.gcWorker.checkUsePhysicalScanLock()
+	c.Assert(err, IsNil)
+	c.Assert(usePhysical, Equals, false)
 
 	err = s.gcWorker.saveValueToSysTable(gcScanLockModeKey, "invalid_mode")
 	c.Assert(err, IsNil)
@@ -552,9 +564,9 @@ const (
 )
 
 func (s *testGCWorkerSuite) testDeleteRangesFailureImpl(c *C, failType int) {
-	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tikv/gcworker/mockHistoryJobForGC", "return(1)"), IsNil)
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/gcworker/mockHistoryJobForGC", "return(1)"), IsNil)
 	defer func() {
-		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/tikv/gcworker/mockHistoryJobForGC"), IsNil)
+		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/gcworker/mockHistoryJobForGC"), IsNil)
 	}()
 
 	// Put some delete range tasks.
@@ -841,10 +853,10 @@ func (s *testGCWorkerSuite) TestLeaderTick(c *C) {
 
 func (s *testGCWorkerSuite) TestResolveLockRangeInfine(c *C) {
 	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tikv/invalidCacheAndRetry", "return(true)"), IsNil)
-	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tikv/gcworker/setGcResolveMaxBackoff", "return(1)"), IsNil)
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/gcworker/setGcResolveMaxBackoff", "return(1)"), IsNil)
 	defer func() {
 		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/tikv/invalidCacheAndRetry"), IsNil)
-		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/tikv/gcworker/setGcResolveMaxBackoff"), IsNil)
+		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/gcworker/setGcResolveMaxBackoff"), IsNil)
 	}()
 	_, err := s.gcWorker.resolveLocksForRange(context.Background(), 1, []byte{0}, []byte{1})
 	c.Assert(err, NotNil)
@@ -1189,9 +1201,7 @@ func (s *testGCWorkerSuite) TestMergeLockScanner(c *C) {
 
 	makeLockList := func(locks ...*tikv.Lock) []*tikv.Lock {
 		res := make([]*tikv.Lock, 0, len(locks))
-		for _, lock := range locks {
-			res = append(res, lock)
-		}
+		res = append(res, locks...)
 		return res
 	}
 
@@ -1377,11 +1387,11 @@ func (s *testGCWorkerSuite) TestResolveLocksPhysical(c *C) {
 		locks := []*kvrpcpb.LockInfo{{Key: []byte{0}}}
 		return &tikvrpc.Response{Resp: &kvrpcpb.PhysicalScanLockResponse{Locks: locks, Error: ""}}, nil
 	}
-	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tikv/gcworker/resolveLocksAcrossRegionsErr", "return(100)"), IsNil)
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/gcworker/resolveLocksAcrossRegionsErr", "return(100)"), IsNil)
 	physicalUsed, err = s.gcWorker.resolveLocks(ctx, safePoint, 3, true)
 	c.Assert(physicalUsed, IsFalse)
 	c.Assert(err, IsNil)
-	c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/tikv/gcworker/resolveLocksAcrossRegionsErr"), IsNil)
+	c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/gcworker/resolveLocksAcrossRegionsErr"), IsNil)
 
 	// Shouldn't fall back when fails to scan locks less than 3 times.
 	reset()
@@ -1424,7 +1434,7 @@ func (s *testGCWorkerSuite) TestResolveLocksPhysical(c *C) {
 	reset()
 	var wg sync.WaitGroup
 	wg.Add(1)
-	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tikv/gcworker/beforeCheckLockObservers", "pause"), IsNil)
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/gcworker/beforeCheckLockObservers", "pause"), IsNil)
 	go func() {
 		defer wg.Done()
 		physicalUsed, err := s.gcWorker.resolveLocks(ctx, safePoint, 3, true)
@@ -1443,13 +1453,13 @@ func (s *testGCWorkerSuite) TestResolveLocksPhysical(c *C) {
 		}
 		return alwaysSucceedHanlder(addr, req)
 	}
-	c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/tikv/gcworker/beforeCheckLockObservers"), IsNil)
+	c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/gcworker/beforeCheckLockObservers"), IsNil)
 	wg.Wait()
 
 	// Shouldn't fall back when a store is removed.
 	reset()
 	wg.Add(1)
-	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tikv/gcworker/beforeCheckLockObservers", "pause"), IsNil)
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/gcworker/beforeCheckLockObservers", "pause"), IsNil)
 	go func() {
 		defer wg.Done()
 		physicalUsed, err := s.gcWorker.resolveLocks(ctx, safePoint, 3, true)
@@ -1459,13 +1469,13 @@ func (s *testGCWorkerSuite) TestResolveLocksPhysical(c *C) {
 	// Sleep to let the goroutine pause.
 	time.Sleep(500 * time.Millisecond)
 	s.cluster.RemoveStore(100)
-	c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/tikv/gcworker/beforeCheckLockObservers"), IsNil)
+	c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/gcworker/beforeCheckLockObservers"), IsNil)
 	wg.Wait()
 
 	// Should fall back when a cleaned store becomes dirty.
 	reset()
 	wg.Add(1)
-	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tikv/gcworker/beforeCheckLockObservers", "pause"), IsNil)
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/gcworker/beforeCheckLockObservers", "pause"), IsNil)
 	go func() {
 		defer wg.Done()
 		physicalUsed, err := s.gcWorker.resolveLocks(ctx, safePoint, 3, true)
@@ -1496,7 +1506,7 @@ func (s *testGCWorkerSuite) TestResolveLocksPhysical(c *C) {
 			return alwaysSucceedHanlder(addr, req)
 		}
 	}
-	c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/tikv/gcworker/beforeCheckLockObservers"), IsNil)
+	c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/gcworker/beforeCheckLockObservers"), IsNil)
 	wg.Wait()
 
 	// Shouldn't fall back when fails to remove lock observers.
@@ -1531,9 +1541,9 @@ func (s *testGCWorkerSuite) TestPhyscailScanLockDeadlock(c *C) {
 
 	// Sleep 1000ms to let the main goroutine block on sending tasks.
 	// Inject error to the goroutine resolving locks so that the main goroutine will block forever if it doesn't handle channels properly.
-	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tikv/gcworker/resolveLocksAcrossRegionsErr", "return(1000)"), IsNil)
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/gcworker/resolveLocksAcrossRegionsErr", "return(1000)"), IsNil)
 	defer func() {
-		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/tikv/gcworker/resolveLocksAcrossRegionsErr"), IsNil)
+		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/gcworker/resolveLocksAcrossRegionsErr"), IsNil)
 	}()
 
 	done := make(chan interface{})
@@ -1552,9 +1562,9 @@ func (s *testGCWorkerSuite) TestPhyscailScanLockDeadlock(c *C) {
 }
 
 func (s *testGCWorkerSuite) TestGCPlacementRules(c *C) {
-	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tikv/gcworker/mockHistoryJobForGC", "return(1)"), IsNil)
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/gcworker/mockHistoryJobForGC", "return(1)"), IsNil)
 	defer func() {
-		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/tikv/gcworker/mockHistoryJobForGC"), IsNil)
+		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/gcworker/mockHistoryJobForGC"), IsNil)
 	}()
 
 	dr := util.DelRangeTask{JobID: 1, ElementID: 1}
