@@ -114,9 +114,9 @@ func (e *AnalyzeExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	}
 	type globalStatsInfo struct {
 		isIndex int
-		// When the `isIndex == 0`, the idxID will be the column ID.
-		// Otherwise, the idxID will be the index ID.
-		idxID        int64
+		// When the `isIndex == 0`, histIDs will be the column IDs.
+		// Otherwise, histIDs will only contain the index ID.
+		histIDs      []int64
 		statsVersion int
 	}
 	// globalStatsMap is a map used to store which partition tables and the corresponding indexes need global-level stats.
@@ -151,19 +151,22 @@ func (e *AnalyzeExec) Next(ctx context.Context, req *chunk.Chunk) error {
 		}
 		if results.TableID.IsPartitionTable() && needGlobalStats {
 			for _, result := range results.Ars {
-				for _, hg := range result.Hist {
-					// It's normal virtual column, skip.
-					if hg == nil {
-						continue
-					}
+				if result.IsIndex == 0 {
 					// If it does not belong to the statistics of index, we need to set it to -1 to distinguish.
-					idxID := int64(-1)
-					if result.IsIndex != 0 {
-						idxID = hg.ID
+					globalStatsID := globalStatsKey{tableID: results.TableID.TableID, indexID: int64(-1)}
+					histIDs := make([]int64, 0, len(result.Hist))
+					for _, hg := range result.Hist {
+						// It's normal virtual column, skip.
+						if hg == nil {
+							continue
+						}
+						histIDs = append(histIDs, hg.ID)
 					}
-					globalStatsID := globalStatsKey{results.TableID.TableID, idxID}
-					if _, ok := globalStatsMap[globalStatsID]; !ok {
-						globalStatsMap[globalStatsID] = globalStatsInfo{result.IsIndex, hg.ID, results.StatsVer}
+					globalStatsMap[globalStatsID] = globalStatsInfo{isIndex: result.IsIndex, histIDs: histIDs, statsVersion: results.StatsVer}
+				} else {
+					for _, hg := range result.Hist {
+						globalStatsID := globalStatsKey{tableID: results.TableID.TableID, indexID: hg.ID}
+						globalStatsMap[globalStatsID] = globalStatsInfo{isIndex: result.IsIndex, histIDs: []int64{hg.ID}, statsVersion: results.StatsVer}
 					}
 				}
 			}
@@ -184,7 +187,7 @@ func (e *AnalyzeExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	}
 	if needGlobalStats {
 		for globalStatsID, info := range globalStatsMap {
-			globalStats, err := statsHandle.MergePartitionStats2GlobalStatsByTableID(e.ctx, e.opts, e.ctx.GetInfoSchema().(infoschema.InfoSchema), globalStatsID.tableID, info.isIndex, info.idxID)
+			globalStats, err := statsHandle.MergePartitionStats2GlobalStatsByTableID(e.ctx, e.opts, e.ctx.GetInfoSchema().(infoschema.InfoSchema), globalStatsID.tableID, info.isIndex, info.histIDs)
 			if err != nil {
 				if types.ErrPartitionStatsMissing.Equal(err) {
 					// When we find some partition-level stats are missing, we need to report warning.
@@ -196,7 +199,7 @@ func (e *AnalyzeExec) Next(ctx context.Context, req *chunk.Chunk) error {
 			for i := 0; i < globalStats.Num; i++ {
 				hg, cms, topN, fms := globalStats.Hg[i], globalStats.Cms[i], globalStats.TopN[i], globalStats.Fms[i]
 				// fms for global stats doesn't need to dump to kv.
-				err = statsHandle.SaveStatsToStorage(globalStatsID.tableID, globalStats.Count, info.isIndex, hg, cms, topN, fms, info.statsVersion, 1, false)
+				err = statsHandle.SaveStatsToStorage(globalStatsID.tableID, globalStats.Count, info.isIndex, hg, cms, topN, fms, info.statsVersion, 1, false, true)
 				if err != nil {
 					logutil.Logger(ctx).Error("save global-level stats to storage failed", zap.Error(err))
 				}
@@ -386,7 +389,7 @@ func (e *AnalyzeIndexExec) fetchAnalyzeResult(ranges []*ranger.Range, isNullRang
 	} else {
 		kvReqBuilder = builder.SetIndexRangesForTables(e.ctx.GetSessionVars().StmtCtx, []int64{e.tableID.GetStatisticsID()}, e.idxInfo.ID, ranges)
 	}
-	kvReqBuilder.SetResourceGroupTag(e.ctx.GetSessionVars().StmtCtx)
+	kvReqBuilder.SetResourceGroupTagger(e.ctx.GetSessionVars().StmtCtx)
 	kvReq, err := kvReqBuilder.
 		SetAnalyzeRequest(e.analyzePB).
 		SetStartTS(e.snapshot).
@@ -747,7 +750,7 @@ func (e *AnalyzeColumnsExec) open(ranges []*ranger.Range) error {
 func (e *AnalyzeColumnsExec) buildResp(ranges []*ranger.Range) (distsql.SelectResult, error) {
 	var builder distsql.RequestBuilder
 	reqBuilder := builder.SetHandleRangesForTables(e.ctx.GetSessionVars().StmtCtx, []int64{e.TableID.GetStatisticsID()}, e.handleCols != nil && !e.handleCols.IsInt(), ranges, nil)
-	builder.SetResourceGroupTag(e.ctx.GetSessionVars().StmtCtx)
+	builder.SetResourceGroupTagger(e.ctx.GetSessionVars().StmtCtx)
 	// Always set KeepOrder of the request to be true, in order to compute
 	// correct `correlation` of columns.
 	kvReq, err := reqBuilder.
@@ -1617,7 +1620,7 @@ func (e *AnalyzeFastExec) calculateEstimateSampleStep() (err error) {
 			return
 		}
 		defer terror.Call(rs.Close)
-		chk := rs.NewChunk()
+		chk := rs.NewChunk(nil)
 		err = rs.Next(context.TODO(), chk)
 		if err != nil {
 			return
@@ -1850,7 +1853,7 @@ func (e *AnalyzeFastExec) handleScanTasks(bo *tikv.Backoffer) (keysSize int, err
 	if e.ctx.GetSessionVars().GetReplicaRead().IsFollowerRead() {
 		snapshot.SetOption(kv.ReplicaRead, kv.ReplicaReadFollower)
 	}
-	setResourceGroupTagForTxn(e.ctx.GetSessionVars().StmtCtx, snapshot)
+	setResourceGroupTaggerForTxn(e.ctx.GetSessionVars().StmtCtx, snapshot)
 	for _, t := range e.scanTasks {
 		iter, err := snapshot.Iter(kv.Key(t.StartKey), kv.Key(t.EndKey))
 		if err != nil {
@@ -1871,7 +1874,7 @@ func (e *AnalyzeFastExec) handleSampTasks(workID int, step uint32, err *error) {
 	snapshot.SetOption(kv.NotFillCache, true)
 	snapshot.SetOption(kv.IsolationLevel, kv.SI)
 	snapshot.SetOption(kv.Priority, kv.PriorityLow)
-	setResourceGroupTagForTxn(e.ctx.GetSessionVars().StmtCtx, snapshot)
+	setResourceGroupTaggerForTxn(e.ctx.GetSessionVars().StmtCtx, snapshot)
 	readReplicaType := e.ctx.GetSessionVars().GetReplicaRead()
 	if readReplicaType.IsFollowerRead() {
 		snapshot.SetOption(kv.ReplicaRead, readReplicaType)
@@ -2045,7 +2048,7 @@ func (e *AnalyzeFastExec) runTasks() ([]*statistics.Histogram, []*statistics.CMS
 func (e *AnalyzeFastExec) buildStats() (hists []*statistics.Histogram, cms []*statistics.CMSketch, topNs []*statistics.TopN, fms []*statistics.FMSketch, err error) {
 	// To set rand seed, it's for unit test.
 	// To ensure that random sequences are different in non-test environments, RandSeed must be set time.Now().
-	if RandSeed == 1 {
+	if atomic.LoadInt64(&RandSeed) == 1 {
 		atomic.StoreInt64(&e.randSeed, time.Now().UnixNano())
 	} else {
 		atomic.StoreInt64(&e.randSeed, RandSeed)

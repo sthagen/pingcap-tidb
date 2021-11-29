@@ -252,7 +252,8 @@ func (m indexUsageMap) update(tableID int64, indexID int64, value *IndexUsageInf
 }
 
 func (m indexUsageMap) merge(destMap indexUsageMap) {
-	for id, item := range destMap {
+	for id := range destMap {
+		item := destMap[id]
 		m.updateByKey(id, &item)
 	}
 }
@@ -700,7 +701,7 @@ func (h *Handle) HandleUpdateStats(is infoschema.InfoSchema) error {
 			tableID, histID, isIndex := int64(-1), int64(-1), int64(-1)
 			var rows []chunk.Row
 			for {
-				req := rc.NewChunk()
+				req := rc.NewChunk(nil)
 				iter := chunk.NewIterator4Chunk(req)
 				err := rc.Next(context.TODO(), req)
 				if err != nil {
@@ -827,7 +828,7 @@ func (h *Handle) deleteOutdatedFeedback(tableID, histID, isIndex int64) error {
 func (h *Handle) dumpStatsUpdateToKV(tableID, isIndex int64, q *statistics.QueryFeedback, hist *statistics.Histogram, cms *statistics.CMSketch, topN *statistics.TopN, fms *statistics.FMSketch, statsVersion int64) error {
 	hist = statistics.UpdateHistogram(hist, q, int(statsVersion))
 	// feedback for partition is not ready.
-	err := h.SaveStatsToStorage(tableID, -1, int(isIndex), hist, cms, topN, fms, int(statsVersion), 0, false)
+	err := h.SaveStatsToStorage(tableID, -1, int(isIndex), hist, cms, topN, fms, int(statsVersion), 0, false, false)
 	metrics.UpdateStatsCounter.WithLabelValues(metrics.RetLabel(err)).Inc()
 	return errors.Trace(err)
 }
