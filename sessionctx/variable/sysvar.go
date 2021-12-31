@@ -1246,12 +1246,9 @@ var defaultSysVars = []*SysVar{
 		return nil
 	}},
 	// variable for top SQL feature.
-	{Scope: ScopeGlobal, Name: TiDBEnableTopSQL, Value: BoolToOnOff(topsqlstate.DefTiDBTopSQLEnable), Type: TypeBool, Hidden: true, AllowEmpty: true, GetGlobal: func(s *SessionVars) (string, error) {
-		return BoolToOnOff(topsqlstate.GlobalState.Enable.Load()), nil
-	}, SetGlobal: func(vars *SessionVars, s string) error {
-		topsqlstate.GlobalState.Enable.Store(TiDBOptOn(s))
-		return nil
-	}, GlobalConfigName: GlobalConfigEnableTopSQL},
+	// TopSQL enable only be controlled by TopSQL pub/sub sinker.
+	// This global variable only uses to update the global config which store in PD(ETCD).
+	{Scope: ScopeGlobal, Name: TiDBEnableTopSQL, Value: BoolToOnOff(topsqlstate.DefTiDBTopSQLEnable), Type: TypeBool, AllowEmpty: true, GlobalConfigName: GlobalConfigEnableTopSQL},
 	{Scope: ScopeGlobal, Name: TiDBTopSQLPrecisionSeconds, Value: strconv.Itoa(topsqlstate.DefTiDBTopSQLPrecisionSeconds), Type: TypeInt, Hidden: true, MinValue: 1, MaxValue: math.MaxInt64, GetGlobal: func(s *SessionVars) (string, error) {
 		return strconv.FormatInt(topsqlstate.GlobalState.PrecisionSeconds.Load(), 10), nil
 	}, SetGlobal: func(vars *SessionVars, s string) error {
@@ -1355,6 +1352,28 @@ var defaultSysVars = []*SysVar{
 		},
 		SetSession: func(s *SessionVars, val string) error {
 			s.ReadConsistency = ReadConsistencyLevel(val)
+			return nil
+		},
+	},
+	{Scope: ScopeGlobal | ScopeSession, Name: TiDBStatsLoadSyncWait, Value: strconv.Itoa(DefTiDBStatsLoadSyncWait), skipInit: true, Type: TypeInt, MinValue: 0, MaxValue: math.MaxInt32,
+		SetSession: func(s *SessionVars, val string) error {
+			s.StatsLoadSyncWait = tidbOptInt64(val, DefTiDBStatsLoadSyncWait)
+			return nil
+		},
+		GetGlobal: func(s *SessionVars) (string, error) {
+			return strconv.FormatInt(StatsLoadSyncWait.Load(), 10), nil
+		},
+		SetGlobal: func(s *SessionVars, val string) error {
+			StatsLoadSyncWait.Store(tidbOptInt64(val, DefTiDBStatsLoadSyncWait))
+			return nil
+		},
+	},
+	{Scope: ScopeGlobal, Name: TiDBStatsLoadPseudoTimeout, Value: BoolToOnOff(DefTiDBStatsLoadPseudoTimeout), skipInit: true, Type: TypeBool,
+		GetGlobal: func(s *SessionVars) (string, error) {
+			return strconv.FormatBool(StatsLoadPseudoTimeout.Load()), nil
+		},
+		SetGlobal: func(s *SessionVars, val string) error {
+			StatsLoadPseudoTimeout.Store(TiDBOptOn(val))
 			return nil
 		},
 	},
