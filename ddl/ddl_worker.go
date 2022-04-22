@@ -240,7 +240,7 @@ func buildJobDependence(t *meta.Meta, curJob *model.Job) error {
 	// Jobs in the same queue are ordered. If we want to find a job's dependency-job, we need to look for
 	// it from the other queue. So if the job is "ActionAddIndex" job, we need find its dependency-job from DefaultJobList.
 	jobListKey := meta.DefaultJobListKey
-	if !mayNeedReorg(curJob) {
+	if !MayNeedReorg(curJob) {
 		jobListKey = meta.AddIndexJobListKey
 	}
 	jobs, err := t.GetAllDDLJobsInQueue(jobListKey)
@@ -301,11 +301,12 @@ func (d *ddl) addBatchDDLJobs(tasks []*limitJobTask) {
 			job.Version = currentVersion
 			job.StartTS = txn.StartTS()
 			job.ID = ids[i]
+			job.State = model.JobStateQueueing
 			if err = buildJobDependence(t, job); err != nil {
 				return errors.Trace(err)
 			}
 			jobListKey := meta.DefaultJobListKey
-			if mayNeedReorg(job) {
+			if MayNeedReorg(job) {
 				jobListKey = meta.AddIndexJobListKey
 			}
 			failpoint.Inject("MockModifyJobArg", func(val failpoint.Value) {
