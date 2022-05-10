@@ -2870,10 +2870,8 @@ func TestTiDBIsOwnerFunc(t *testing.T) {
 
 	tk := testkit.NewTestKit(t, store)
 	result := tk.MustQuery("select tidb_is_ddl_owner()")
-	ddlOwnerChecker := tk.Session().DDLOwnerChecker()
-	require.NotNil(t, ddlOwnerChecker)
 	var ret int64
-	if ddlOwnerChecker.IsOwner() {
+	if tk.Session().IsDDLOwner() {
 		ret = 1
 	}
 	result.Check(testkit.Rows(fmt.Sprintf("%v", ret)))
@@ -4392,6 +4390,18 @@ func TestCollationAndCharset(t *testing.T) {
 	tk.MustQuery("select trim(both 'abc' collate utf8mb4_bin from 'c' collate utf8mb4_general_ci);").Check(testkit.Rows("c"))
 	tk.MustQuery("select substr('abc' collate utf8mb4_bin, 2 collate `binary`);").Check(testkit.Rows("bc"))
 	tk.MustQuery("select replace('abc' collate utf8mb4_bin, 'b' collate utf8mb4_general_ci, 'd' collate utf8mb4_unicode_ci);").Check(testkit.Rows("adc"))
+}
+
+// https://github.com/pingcap/tidb/issues/34500.
+func TestJoinOnDifferentCollations(t *testing.T) {
+	store, clean := testkit.CreateMockStore(t)
+	defer clean()
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test;")
+	tk.MustExec("create table t (a char(10) charset gbk collate gbk_chinese_ci, b time);")
+	tk.MustExec("insert into t values ('08:00:00', '08:00:00');")
+	tk.MustQuery("select t1.a, t2.b from t as t1 right join t as t2 on t1.a = t2.b;").
+		Check(testkit.Rows("08:00:00 08:00:00"))
 }
 
 func TestCoercibility(t *testing.T) {
