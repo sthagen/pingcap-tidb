@@ -12,7 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package config
+package errcheck
 
-// DefRowsForSampleRate is default sample rows used to calculate samplerate.
-const DefRowsForSampleRate = 110000
+import (
+	"embed"
+	"log"
+
+	"github.com/kisielk/errcheck/errcheck"
+	"github.com/pingcap/tidb/build/linter/util"
+)
+
+// Analyzer is the analyzer struct of errcheck.
+var Analyzer = errcheck.Analyzer
+
+//go:embed errcheck_excludes.txt
+var excludesContent embed.FS
+
+func init() {
+	data, _ := excludesContent.ReadFile("errcheck_excludes.txt")
+	err := Analyzer.Flags.Set("excludes", string(data))
+	if err != nil {
+		log.Fatal(err)
+	}
+	util.SkipAnalyzer(Analyzer)
+}
