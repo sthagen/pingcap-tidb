@@ -1825,14 +1825,13 @@ func tryLockMDLAndUpdateSchemaIfNecessary(sctx sessionctx.Context, dbName model.
 		}
 		domainSchema := domain.GetDomain(sctx).InfoSchema()
 		domainSchemaVer := domainSchema.SchemaMetaVersion()
-		if !skipLock {
-			sctx.GetSessionVars().GetRelatedTableForMDL().Store(tableInfo.ID, domainSchemaVer)
-		}
-
 		var err error
 		tbl, err = domainSchema.TableByName(dbName, tableInfo.Name)
 		if err != nil {
 			return nil, err
+		}
+		if !skipLock {
+			sctx.GetSessionVars().GetRelatedTableForMDL().Store(tbl.Meta().ID, domainSchemaVer)
 		}
 		// Check the table change, if adding new public index or modify a column, we need to handle them.
 		if !sctx.GetSessionVars().IsPessimisticReadConsistency() {
@@ -1875,7 +1874,7 @@ func tryLockMDLAndUpdateSchemaIfNecessary(sctx sessionctx.Context, dbName model.
 					}
 				}
 				if found {
-					return nil, ErrSchemaChanged.GenWithStack("public column %s has changed", col.Name)
+					return nil, domain.ErrInfoSchemaChanged.GenWithStack("public column %s has changed", col.Name)
 				}
 			}
 		}

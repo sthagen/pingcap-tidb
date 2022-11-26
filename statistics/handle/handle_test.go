@@ -2157,11 +2157,13 @@ func TestPartitionPruneModeSessionVariable(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 	tk1 := testkit.NewTestKit(t, store)
 	tk1.MustExec("use test")
+	tk1.MustExec("set tidb_cost_model_version=1")
 	tk1.MustExec("set @@tidb_partition_prune_mode = '" + string(variable.Dynamic) + "'")
 	tk1.MustExec(`set @@tidb_analyze_version=2`)
 
 	tk2 := testkit.NewTestKit(t, store)
 	tk2.MustExec("use test")
+	tk2.MustExec("set tidb_cost_model_version=1")
 	tk2.MustExec("set @@tidb_partition_prune_mode = '" + string(variable.Static) + "'")
 	tk2.MustExec(`set @@tidb_analyze_version=2`)
 
@@ -2225,8 +2227,8 @@ func TestFMSWithAnalyzePartition(t *testing.T) {
 	tk.MustQuery("show warnings").Sort().Check(testkit.Rows(
 		"Note 1105 Analyze use auto adjusted sample rate 1.000000 for table test.t's partition p0",
 		"Warning 1105 Ignore columns and options when analyze partition in dynamic mode",
-		"Warning 8131 Build table: `t` global-level stats failed due to missing partition-level stats",
-		"Warning 8131 Build table: `t` index: `a` global-level stats failed due to missing partition-level stats",
+		"Warning 8131 Build global-level stats failed due to missing partition-level stats: table `t` partition `p1`",
+		"Warning 8131 Build global-level stats failed due to missing partition-level stats: table `t` partition `p1`",
 	))
 	tk.MustQuery("select count(*) from mysql.stats_fm_sketch").Check(testkit.Rows("2"))
 }

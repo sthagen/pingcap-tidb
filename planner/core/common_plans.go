@@ -587,6 +587,10 @@ type PlanReplayer struct {
 	Analyze  bool
 	Load     bool
 	File     string
+
+	Capture    bool
+	SQLDigest  string
+	PlanDigest string
 }
 
 // IndexAdvise represents a index advise plan.
@@ -883,8 +887,8 @@ func getRuntimeInfo(ctx sessionctx.Context, p Plan, runtimeStatsColl *execdetail
 	if runtimeStatsColl != nil && runtimeStatsColl.ExistsCopStats(explainID) {
 		copStats = runtimeStatsColl.GetCopStats(explainID)
 	}
-	memTracker = ctx.GetSessionVars().StmtCtx.MemTracker.SearchTrackerWithLock(p.ID())
-	diskTracker = ctx.GetSessionVars().StmtCtx.DiskTracker.SearchTrackerWithLock(p.ID())
+	memTracker = ctx.GetSessionVars().StmtCtx.MemTracker.SearchTrackerWithoutLock(p.ID())
+	diskTracker = ctx.GetSessionVars().StmtCtx.DiskTracker.SearchTrackerWithoutLock(p.ID())
 	return
 }
 
