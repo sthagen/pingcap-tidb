@@ -145,10 +145,13 @@ var (
 	telemetryTablePartitionAddIntervalUsage     = metrics.TelemetryTablePartitionAddIntervalPartitionsCnt
 	telemetryTablePartitionDropIntervalUsage    = metrics.TelemetryTablePartitionDropIntervalPartitionsCnt
 	telemetryExchangePartitionUsage             = metrics.TelemetryExchangePartitionCnt
+	telemetryTableCompactPartitionUsage         = metrics.TelemetryCompactPartitionCnt
 
 	telemetryLockUserUsage          = metrics.TelemetryAccountLockCnt.WithLabelValues("lockUser")
 	telemetryUnlockUserUsage        = metrics.TelemetryAccountLockCnt.WithLabelValues("unlockUser")
 	telemetryCreateOrAlterUserUsage = metrics.TelemetryAccountLockCnt.WithLabelValues("createOrAlterUser")
+
+	telemetryIndexMerge = metrics.TelemetryIndexMergeUsage
 )
 
 // Session context, it is consistent with the lifecycle of a client connection.
@@ -291,6 +294,8 @@ type session struct {
 	advisoryLocks map[string]*advisoryLock
 
 	extensions *extension.SessionExtensions
+
+	sandBoxMode bool
 }
 
 var parserPool = &sync.Pool{New: func() interface{} { return parser.New() }}
@@ -1588,6 +1593,7 @@ func (s *session) SetProcessInfo(sql string, t time.Time, command byte, maxExecu
 		Info:                  sql,
 		CurTxnStartTS:         curTxnStartTS,
 		StmtCtx:               s.sessionVars.StmtCtx,
+		RefCountOfStmtCtx:     &s.sessionVars.RefCountOfStmtCtx,
 		MemTracker:            s.sessionVars.MemTracker,
 		DiskTracker:           s.sessionVars.DiskTracker,
 		StatsInfo:             plannercore.GetStatsInfo,
@@ -1865,6 +1871,21 @@ func (s *session) GetExtensions() *extension.SessionExtensions {
 // SetExtensions sets the `*extension.SessionExtensions` object
 func (s *session) SetExtensions(extensions *extension.SessionExtensions) {
 	s.extensions = extensions
+}
+
+// InSandBoxMode indicates that this session is in sandbox mode
+func (s *session) InSandBoxMode() bool {
+	return s.sandBoxMode
+}
+
+// EnableSandBoxMode enable the sandbox mode.
+func (s *session) EnableSandBoxMode() {
+	s.sandBoxMode = true
+}
+
+// DisableSandBoxMode enable the sandbox mode.
+func (s *session) DisableSandBoxMode() {
+	s.sandBoxMode = false
 }
 
 // ParseWithParams4Test wrapper (s *session) ParseWithParams for test
@@ -2449,7 +2470,6 @@ func (s *session) PrepareStmt(sql string) (stmtID uint32, paramCount int, fields
 	}
 
 	ctx := context.Background()
-	inTxn := s.GetSessionVars().InTxn()
 	// NewPrepareExec may need startTS to build the executor, for example prepare statement has subquery in int.
 	// So we have to call PrepareTxnCtx here.
 	if err = s.PrepareTxnCtx(ctx); err != nil {
@@ -2466,12 +2486,11 @@ func (s *session) PrepareStmt(sql string) (stmtID uint32, paramCount int, fields
 	}
 	prepareExec := executor.NewPrepareExec(s, sql)
 	err = prepareExec.Next(ctx, nil)
+	// Rollback even if err is nil.
+	s.rollbackOnError(ctx)
+
 	if err != nil {
 		return
-	}
-	if !inTxn {
-		// We could start a transaction to build the prepare executor before, we should rollback it here.
-		s.RollbackTxn(ctx)
 	}
 	return prepareExec.ID, prepareExec.ParamCount, prepareExec.Fields, nil
 }
@@ -2582,7 +2601,7 @@ func (s *session) GetSessionVars() *variable.SessionVars {
 
 func (s *session) AuthPluginForUser(user *auth.UserIdentity) (string, error) {
 	pm := privilege.GetPrivilegeManager(s)
-	authplugin, err := pm.GetAuthPlugin(user.Username, user.Hostname)
+	authplugin, err := pm.GetAuthPluginForConnection(user.Username, user.Hostname)
 	if err != nil {
 		return "", err
 	}
@@ -2602,8 +2621,14 @@ func (s *session) Auth(user *auth.UserIdentity, authentication, salt []byte) err
 	if err != nil {
 		return privileges.ErrAccessDenied.FastGenByArgs(user.Username, user.Hostname, hasPassword)
 	}
-	if err = pm.ConnectionVerification(user, authUser.Username, authUser.Hostname, authentication, salt, s.sessionVars.TLSConnectionState); err != nil {
-		return err
+	if err := pm.ConnectionVerification(user, authUser.Username, authUser.Hostname, authentication, salt, s.sessionVars); err != nil {
+		switch err.(type) {
+		case *privileges.ErrInSandBoxMode:
+			// Enter sandbox mode, only execute statement for resetting password.
+			s.EnableSandBoxMode()
+		default:
+			return err
+		}
 	}
 	user.AuthUsername = authUser.Username
 	user.AuthHostname = authUser.Hostname
@@ -2898,11 +2923,17 @@ func InitMDLVariable(store kv.Storage) error {
 		if err != nil {
 			return err
 		}
+		if isNull {
+			// Workaround for version: nightly-2022-11-07 to nightly-2022-11-17.
+			enable = true
+			logutil.BgLogger().Warn("metadata lock is null")
+			err = t.SetMetadataLock(true)
+			if err != nil {
+				return err
+			}
+		}
 		return nil
 	})
-	if isNull {
-		return errors.New("metadata lock is null")
-	}
 	variable.EnableMDL.Store(enable)
 	return err
 }
@@ -2942,7 +2973,7 @@ func BootstrapSession(store kv.Storage) (*domain.Domain, error) {
 
 	analyzeConcurrencyQuota := int(config.GetGlobalConfig().Performance.AnalyzePartitionConcurrencyQuota)
 	concurrency := int(config.GetGlobalConfig().Performance.StatsLoadConcurrency)
-	ses, err := createSessions(store, 9)
+	ses, err := createSessions(store, 10)
 	if err != nil {
 		return nil, err
 	}
@@ -3022,6 +3053,9 @@ func BootstrapSession(store kv.Storage) (*domain.Domain, error) {
 	// setup dumpFileGcChecker
 	dom.SetupDumpFileGCChecker(ses[8])
 	dom.DumpFileGcCheckerLoop()
+	// setup historical stats worker
+	dom.SetupHistoricalStatsWorker(ses[9])
+	dom.StartHistoricalStatsWorker()
 
 	// A sub context for update table stats, and other contexts for concurrent stats loading.
 	cnt := 1 + concurrency
@@ -3136,7 +3170,7 @@ func createSessionWithOpt(store kv.Storage, opt *Opt) (*session, error) {
 	s.sessionVars.BinlogClient = binloginfo.GetPumpsClient()
 	s.txn.init()
 
-	sessionBindHandle := bindinfo.NewSessionBindHandle(parser.New())
+	sessionBindHandle := bindinfo.NewSessionBindHandle()
 	s.SetValue(bindinfo.SessionBindInfoKeyType, sessionBindHandle)
 	s.SetSessionStatesHandler(sessionstates.StateBinding, sessionBindHandle)
 	return s, nil
@@ -3582,6 +3616,10 @@ func (s *session) updateTelemetryMetric(es *executor.ExecStmt) {
 		telemetryCTEUsageNotCTE.Inc()
 	}
 
+	if ti.UseIndexMerge {
+		telemetryIndexMerge.Inc()
+	}
+
 	if ti.UseMultiSchemaChange {
 		telemetryMultiSchemaChangeUsage.Inc()
 	}
@@ -3632,6 +3670,9 @@ func (s *session) updateTelemetryMetric(es *executor.ExecStmt) {
 		if ti.PartitionTelemetry.UseDropIntervalPartition {
 			telemetryTablePartitionDropIntervalUsage.Inc()
 		}
+		if ti.PartitionTelemetry.UseCompactTablePartition {
+			telemetryTableCompactPartitionUsage.Inc()
+		}
 	}
 
 	if ti.AccountLockTelemetry != nil {
@@ -3666,6 +3707,11 @@ func (s *session) GetStmtStats() *stmtstats.StatementStats {
 // SetMemoryFootprintChangeHook sets the hook that is called when the memdb changes its size.
 // Call this after s.txn becomes valid, since TxnInfo is initialized when the txn becomes valid.
 func (s *session) SetMemoryFootprintChangeHook() {
+	if config.GetGlobalConfig().Performance.TxnTotalSizeLimit != config.DefTxnTotalSizeLimit {
+		// if the user manually specifies the config, don't involve the new memory tracker mechanism, let the old config
+		// work as before.
+		return
+	}
 	hook := func(mem uint64) {
 		if s.sessionVars.MemDBFootprint == nil {
 			tracker := memory.NewTracker(memory.LabelForMemDB, -1)
