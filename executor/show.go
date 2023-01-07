@@ -1010,8 +1010,9 @@ func ConstructResultOfShowCreateTable(ctx sessionctx.Context, tableInfo *model.T
 						}
 						buf.WriteString(" DEFAULT NULL")
 					}
-				case "CURRENT_TIMESTAMP":
-					buf.WriteString(" DEFAULT CURRENT_TIMESTAMP")
+				case "CURRENT_TIMESTAMP", "CURRENT_DATE":
+					buf.WriteString(" DEFAULT ")
+					buf.WriteString(defaultValue.(string))
 					if col.GetDecimal() > 0 {
 						buf.WriteString(fmt.Sprintf("(%d)", col.GetDecimal()))
 					}
@@ -1255,6 +1256,18 @@ func ConstructResultOfShowCreateTable(ctx sessionctx.Context, tableInfo *model.T
 			} else {
 				restoreCtx.WriteString("OFF")
 			}
+			return nil
+		})
+
+		if err != nil {
+			return err
+		}
+
+		restoreCtx.WritePlain(" ")
+		err = restoreCtx.WriteWithSpecialComments(tidb.FeatureIDTTL, func() error {
+			restoreCtx.WriteKeyWord("TTL_JOB_INTERVAL")
+			restoreCtx.WritePlain("=")
+			restoreCtx.WriteString(tableInfo.TTLInfo.JobInterval.String())
 			return nil
 		})
 

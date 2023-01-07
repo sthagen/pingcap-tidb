@@ -908,6 +908,7 @@ var MySQLErrName = map[uint16]*mysql.ErrMessage{
 	ErrFKIncompatibleColumns:                                 mysql.Message("Referencing column '%s' and referenced column '%s' in foreign key constraint '%s' are incompatible.", nil),
 	ErrFunctionalIndexRowValueIsNotAllowed:                   mysql.Message("Expression of expression index '%s' cannot refer to a row value", nil),
 	ErrDependentByFunctionalIndex:                            mysql.Message("Column '%s' has an expression index dependency and cannot be dropped or renamed", nil),
+	ErrDependentByPartitionFunctional:                        mysql.Message("Column '%s' has a partitioning function dependency and cannot be dropped or renamed", nil),
 	ErrCannotConvertString:                                   mysql.Message("Cannot convert string '%.64s' from %s to %s", nil),
 	ErrInvalidJSONValueForFuncIndex:                          mysql.Message("Invalid JSON value for CAST for expression index '%s'", nil),
 	ErrJSONValueOutOfRangeForFuncIndex:                       mysql.Message("Out of range JSON value for CAST for expression index '%s'", nil),
@@ -1034,7 +1035,7 @@ var MySQLErrName = map[uint16]*mysql.ErrMessage{
 	ErrLazyUniquenessCheckFailure:    mysql.Message("transaction aborted because lazy uniqueness check is enabled and an error occurred: %s", nil),
 	ErrUnsupportedColumnInTTLConfig:  mysql.Message("Field '%-.192s' is of a not supported type for TTL config, expect DATETIME, DATE or TIMESTAMP", nil),
 	ErrTTLColumnCannotDrop:           mysql.Message("Cannot drop column '%-.192s': needed in TTL config", nil),
-	ErrSetTTLEnableForNonTTLTable:    mysql.Message("Cannot set TTL_ENABLE on a table without TTL config", nil),
+	ErrSetTTLOptionForNonTTLTable:    mysql.Message("Cannot set %s on a table without TTL config", nil),
 	ErrTempTableNotAllowedWithTTL:    mysql.Message("Set TTL for temporary table is not allowed", nil),
 	ErrUnsupportedTTLReferencedByFK:  mysql.Message("Set TTL for a table referenced by foreign key is not allowed", nil),
 
