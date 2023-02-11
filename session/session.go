@@ -29,7 +29,6 @@ import (
 	"math"
 	"math/rand"
 	"runtime/pprof"
-	"runtime/trace"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,7 +36,6 @@ import (
 	"time"
 
 	"github.com/ngaut/pools"
-	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
@@ -105,6 +103,7 @@ import (
 	"github.com/pingcap/tidb/util/topsql"
 	topsqlstate "github.com/pingcap/tidb/util/topsql/state"
 	"github.com/pingcap/tidb/util/topsql/stmtstats"
+	"github.com/pingcap/tidb/util/tracing"
 	"github.com/pingcap/tipb/go-binlog"
 	tikverr "github.com/tikv/client-go/v2/error"
 	tikvstore "github.com/tikv/client-go/v2/kv"
@@ -149,12 +148,14 @@ var (
 	telemetryTablePartitionDropIntervalUsage    = metrics.TelemetryTablePartitionDropIntervalPartitionsCnt
 	telemetryExchangePartitionUsage             = metrics.TelemetryExchangePartitionCnt
 	telemetryTableCompactPartitionUsage         = metrics.TelemetryCompactPartitionCnt
+	telemetryReorganizePartitionUsage           = metrics.TelemetryReorganizePartitionCnt
 
 	telemetryLockUserUsage          = metrics.TelemetryAccountLockCnt.WithLabelValues("lockUser")
 	telemetryUnlockUserUsage        = metrics.TelemetryAccountLockCnt.WithLabelValues("unlockUser")
 	telemetryCreateOrAlterUserUsage = metrics.TelemetryAccountLockCnt.WithLabelValues("createOrAlterUser")
 
-	telemetryIndexMerge = metrics.TelemetryIndexMergeUsage
+	telemetryIndexMerge        = metrics.TelemetryIndexMergeUsage
+	telemetryStoreBatchedUsage = metrics.TelemetryStoreBatchedQueryCnt
 )
 
 // Session context, it is consistent with the lifecycle of a client connection.
@@ -956,11 +957,9 @@ func (s *session) doCommitWithRetry(ctx context.Context) error {
 	var err error
 	txnSize := s.txn.Size()
 	isPessimistic := s.txn.IsPessimistic()
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("session.doCommitWitRetry", opentracing.ChildOf(span.Context()))
-		defer span1.Finish()
-		ctx = opentracing.ContextWithSpan(ctx, span1)
-	}
+	r, ctx := tracing.StartRegionEx(ctx, "session.doCommitWithRetry")
+	defer r.End()
+
 	err = s.doCommit(ctx)
 	if err != nil {
 		// polish the Write Conflict error message
@@ -1083,11 +1082,8 @@ func (s *session) updateStatsDeltaToCollector() {
 }
 
 func (s *session) CommitTxn(ctx context.Context) error {
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("session.CommitTxn", opentracing.ChildOf(span.Context()))
-		defer span1.Finish()
-		ctx = opentracing.ContextWithSpan(ctx, span1)
-	}
+	r, ctx := tracing.StartRegionEx(ctx, "session.CommitTxn")
+	defer r.End()
 
 	var commitDetail *tikvutil.CommitDetails
 	ctx = context.WithValue(ctx, tikvutil.CommitDetailCtxKey, &commitDetail)
@@ -1095,6 +1091,9 @@ func (s *session) CommitTxn(ctx context.Context) error {
 	if commitDetail != nil {
 		s.sessionVars.StmtCtx.MergeExecDetails(nil, commitDetail)
 	}
+
+	// record the TTLInsertRows in the metric
+	metrics.TTLInsertRowsCount.Add(float64(s.sessionVars.TxnCtx.InsertTTLRowsCount))
 
 	failpoint.Inject("keepHistory", func(val failpoint.Value) {
 		if val.(bool) {
@@ -1107,10 +1106,8 @@ func (s *session) CommitTxn(ctx context.Context) error {
 }
 
 func (s *session) RollbackTxn(ctx context.Context) {
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("session.RollbackTxn", opentracing.ChildOf(span.Context()))
-		defer span1.Finish()
-	}
+	r, ctx := tracing.StartRegionEx(ctx, "session.RollbackTxn")
+	defer r.End()
 
 	if s.txn.Valid() {
 		terror.Log(s.txn.Rollback())
@@ -1537,11 +1534,7 @@ func (s *session) GetTiDBTableValue(name string) (string, error) {
 var _ sqlexec.SQLParser = &session{}
 
 func (s *session) ParseSQL(ctx context.Context, sql string, params ...parser.ParseParam) ([]ast.StmtNode, []error, error) {
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("session.ParseSQL", opentracing.ChildOf(span.Context()))
-		defer span1.Finish()
-	}
-	defer trace.StartRegion(ctx, "ParseSQL").End()
+	defer tracing.StartRegion(ctx, "ParseSQL").End()
 
 	p := parserPool.Get().(*parser.Parser)
 	defer parserPool.Put(p)
@@ -1609,7 +1602,7 @@ func (s *session) SetProcessInfo(sql string, t time.Time, command byte, maxExecu
 		}
 	}
 	// We set process info before building plan, so we extended execution time.
-	if oldPi != nil && oldPi.Info == pi.Info {
+	if oldPi != nil && oldPi.Info == pi.Info && oldPi.Command == pi.Command {
 		pi.Time = oldPi.Time
 	}
 	_, digest := s.sessionVars.StmtCtx.SQLDigest()
@@ -1655,12 +1648,9 @@ func (s *session) ExecuteInternal(ctx context.Context, sql string, args ...inter
 		pprof.SetGoroutineLabels(ctx)
 	}()
 
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("session.ExecuteInternal", opentracing.ChildOf(span.Context()))
-		defer span1.Finish()
-		ctx = opentracing.ContextWithSpan(ctx, span1)
-		logutil.Eventf(ctx, "execute: %s", sql)
-	}
+	r, ctx := tracing.StartRegionEx(ctx, "session.ExecuteInternal")
+	defer r.End()
+	logutil.Eventf(ctx, "execute: %s", sql)
 
 	stmtNode, err := s.ParseWithParams(ctx, sql, args...)
 	if err != nil {
@@ -1680,12 +1670,9 @@ func (s *session) ExecuteInternal(ctx context.Context, sql string, args ...inter
 
 // Execute is deprecated, we can remove it as soon as plugins are migrated.
 func (s *session) Execute(ctx context.Context, sql string) (recordSets []sqlexec.RecordSet, err error) {
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("session.Execute", opentracing.ChildOf(span.Context()))
-		defer span1.Finish()
-		ctx = opentracing.ContextWithSpan(ctx, span1)
-		logutil.Eventf(ctx, "execute: %s", sql)
-	}
+	r, ctx := tracing.StartRegionEx(ctx, "session.Execute")
+	defer r.End()
+	logutil.Eventf(ctx, "execute: %s", sql)
 
 	stmtNodes, err := s.Parse(ctx, sql)
 	if err != nil {
@@ -2123,16 +2110,12 @@ func (s *session) ExecuteInternalStmt(ctx context.Context, stmtNode ast.StmtNode
 }
 
 func (s *session) ExecuteStmt(ctx context.Context, stmtNode ast.StmtNode) (sqlexec.RecordSet, error) {
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("session.ExecuteStmt", opentracing.ChildOf(span.Context()))
-		defer span1.Finish()
-		ctx = opentracing.ContextWithSpan(ctx, span1)
-	}
+	r, ctx := tracing.StartRegionEx(ctx, "session.ExecuteStmt")
+	defer r.End()
 
 	if err := s.PrepareTxnCtx(ctx); err != nil {
 		return nil, err
 	}
-
 	if err := s.loadCommonGlobalVariablesIfNeeded(); err != nil {
 		return nil, err
 	}
@@ -2215,6 +2198,13 @@ func (s *session) ExecuteStmt(ctx context.Context, stmtNode ast.StmtNode) (sqlex
 		s.txn.changeToInvalid()
 	} else {
 		recordSet, err = runStmt(ctx, s, stmt)
+	}
+
+	// Observe the resource group query total counter if the resource control is enabled and the
+	// current session is attached with a resource group.
+	resourceGroupName := s.GetSessionVars().ResourceGroupName
+	if len(resourceGroupName) > 0 && resourceGroupName != variable.DefaultResourceGroupName {
+		metrics.ResourceGroupQueryTotalCounter.WithLabelValues(resourceGroupName).Inc()
 	}
 
 	if err != nil {
@@ -2311,12 +2301,12 @@ func runStmt(ctx context.Context, se *session, s sqlexec.Statement) (rs sqlexec.
 		}
 	})
 
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("session.runStmt", opentracing.ChildOf(span.Context()))
-		span1.LogKV("sql", s.OriginText())
-		defer span1.Finish()
-		ctx = opentracing.ContextWithSpan(ctx, span1)
+	r, ctx := tracing.StartRegionEx(ctx, "session.runStmt")
+	defer r.End()
+	if r.Span != nil {
+		r.Span.LogKV("sql", s.OriginText())
 	}
+
 	se.SetValue(sessionctx.QueryString, s.OriginText())
 	if _, ok := s.(*executor.ExecStmt).StmtNode.(ast.DDLNode); ok {
 		se.SetValue(sessionctx.LastExecuteDDL, true)
@@ -3085,8 +3075,8 @@ var (
 	}
 	// BackfillTables is a list of tables definitions used in dist reorg DDL.
 	BackfillTables = []tableBasicInfo{
-		{ddl.BackfillTableSQL, ddl.BackfillTableID},
-		{ddl.BackfillHistoryTableSQL, ddl.BackfillHistoryTableID},
+		{ddl.BackgroundSubtaskTableSQL, ddl.BackgroundSubtaskTableID},
+		{ddl.BackgroundSubtaskHistoryTableSQL, ddl.BackgroundSubtaskHistoryTableID},
 	}
 	mdlTable = "create table mysql.tidb_mdl_info(job_id BIGINT NOT NULL PRIMARY KEY, version BIGINT NOT NULL, table_ids text(65535));"
 )
@@ -3105,7 +3095,7 @@ func splitAndScatterTable(store kv.Storage, tableIDs []int64) {
 	}
 }
 
-// InitDDLJobTables is to create tidb_ddl_job, tidb_ddl_reorg and tidb_ddl_history, or tidb_ddl_backfill and tidb_ddl_backfill_history.
+// InitDDLJobTables is to create tidb_ddl_job, tidb_ddl_reorg and tidb_ddl_history, or tidb_background_subtask and tidb_background_subtask_history.
 func InitDDLJobTables(store kv.Storage, targetVer meta.DDLTableVersion) error {
 	targetTables := DDLJobTables
 	if targetVer == meta.BackfillTableVersion {
@@ -4010,7 +4000,7 @@ func (s *session) updateTelemetryMetric(es *executor.ExecStmt) {
 		telemetryFlashbackClusterUsage.Inc()
 	}
 
-	if ti.UesExchangePartition {
+	if ti.UseExchangePartition {
 		telemetryExchangePartitionUsage.Inc()
 	}
 
@@ -4055,12 +4045,19 @@ func (s *session) updateTelemetryMetric(es *executor.ExecStmt) {
 		if ti.PartitionTelemetry.UseCompactTablePartition {
 			telemetryTableCompactPartitionUsage.Inc()
 		}
+		if ti.PartitionTelemetry.UseReorganizePartition {
+			telemetryReorganizePartitionUsage.Inc()
+		}
 	}
 
 	if ti.AccountLockTelemetry != nil {
 		telemetryLockUserUsage.Add(float64(ti.AccountLockTelemetry.LockUser))
 		telemetryUnlockUserUsage.Add(float64(ti.AccountLockTelemetry.UnlockUser))
 		telemetryCreateOrAlterUserUsage.Add(float64(ti.AccountLockTelemetry.CreateOrAlterUser))
+	}
+
+	if ti.UseTableLookUp && s.sessionVars.StoreBatchSize > 0 {
+		telemetryStoreBatchedUsage.Inc()
 	}
 }
 
@@ -4143,8 +4140,9 @@ func (s *session) EncodeSessionStates(ctx context.Context, sctx sessionctx.Conte
 	sessionStates.SystemVars = make(map[string]string)
 	for _, sv := range variable.GetSysVars() {
 		switch {
-		case sv.Hidden, sv.HasNoneScope(), sv.HasInstanceScope(), !sv.HasSessionScope():
-			// Hidden and none-scoped variables cannot be modified.
+		case sv.HasNoneScope(), sv.HasInstanceScope(), !sv.HasSessionScope():
+			// Hidden attribute is deprecated.
+			// None-scoped variables cannot be modified.
 			// Instance-scoped variables don't need to be encoded.
 			// Noop variables should also be migrated even if they are noop.
 			continue
