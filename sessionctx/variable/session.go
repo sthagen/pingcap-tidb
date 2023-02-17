@@ -1358,9 +1358,9 @@ type SessionVars struct {
 	// is enabled.
 	PessimisticTransactionAggressiveLocking bool
 
-	// EnableIndexJoinInnerSideMultiPattern indicates whether enable multi pattern for index join inner side
+	// EnableINLJoinInnerMultiPattern indicates whether enable multi pattern for index join inner side
 	// For now it is not public to user
-	EnableIndexJoinInnerSideMultiPattern bool
+	EnableINLJoinInnerMultiPattern bool
 }
 
 // planReplayerSessionFinishedTaskKeyLen is used to control the max size for the finished plan replayer task key in session
@@ -1425,6 +1425,16 @@ func (s *SessionVars) SetAlloc(alloc chunk.Allocator) {
 		return
 	}
 	s.ChunkPool.Alloc = alloc
+}
+
+// IsAllocValid check if chunk reuse is enable or ChunkPool is inused.
+func (s *SessionVars) IsAllocValid() bool {
+	if !s.EnableReuseCheck {
+		return false
+	}
+	s.ChunkPool.mu.Lock()
+	defer s.ChunkPool.mu.Unlock()
+	return s.ChunkPool.Alloc != nil
 }
 
 // ClearAlloc indicates stop reuse chunk

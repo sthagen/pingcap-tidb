@@ -69,6 +69,8 @@ import (
 	"github.com/pingcap/tidb/util/engine"
 	"github.com/pingcap/tidb/util/etcd"
 	"github.com/pingcap/tidb/util/expensivequery"
+	"github.com/pingcap/tidb/util/gctuner"
+	"github.com/pingcap/tidb/util/intest"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/memoryusagealarm"
@@ -149,6 +151,8 @@ type Domain struct {
 		sync.Mutex
 		sctxs map[sessionctx.Context]bool
 	}
+
+	stopAutoAnalyze atomicutil.Bool
 }
 
 type mdlCheckTableInfo struct {
@@ -903,6 +907,19 @@ func (do *Domain) Close() {
 		do.info.RemoveServerInfo()
 		do.info.RemoveMinStartTS()
 	}
+	ttlJobManager := do.ttlJobManager.Load()
+	if ttlJobManager != nil {
+		ttlJobManager.Stop()
+		err := ttlJobManager.WaitStopped(context.Background(), func() time.Duration {
+			if intest.InTest {
+				return 10 * time.Second
+			}
+			return 30 * time.Second
+		}())
+		if err != nil {
+			logutil.BgLogger().Warn("fail to wait until the ttl job manager stop", zap.Error(err))
+		}
+	}
 	close(do.exit)
 	if do.etcdClient != nil {
 		terror.Log(errors.Trace(do.etcdClient.Close()))
@@ -922,6 +939,7 @@ func (do *Domain) Close() {
 	if do.onClose != nil {
 		do.onClose()
 	}
+	gctuner.WaitMemoryLimitTunerExitInTest()
 	logutil.BgLogger().Info("domain closed", zap.Duration("take time", time.Since(startTime)))
 }
 
@@ -946,6 +964,7 @@ func NewDomain(store kv.Storage, ddlLease time.Duration, statsLease time.Duratio
 			jobsIdsMap: make(map[int64]string),
 		},
 	}
+	do.stopAutoAnalyze.Store(false)
 	do.wg = util.NewWaitGroupEnhancedWrapper("domain", do.exit, config.GetGlobalConfig().TiDBEnableExitCheck)
 	do.SchemaValidator = NewSchemaValidator(ddlLease, do)
 	do.expensiveQueryHandle = expensivequery.NewExpensiveQueryHandle(do.exit)
@@ -2171,7 +2190,7 @@ func (do *Domain) autoAnalyzeWorker(owner owner.Manager) {
 	for {
 		select {
 		case <-analyzeTicker.C:
-			if variable.RunAutoAnalyze.Load() && owner.IsOwner() {
+			if variable.RunAutoAnalyze.Load() && !do.stopAutoAnalyze.Load() && owner.IsOwner() {
 				statsHandle.HandleAutoAnalyze(do.InfoSchema())
 			}
 		case <-do.exit:
@@ -2543,18 +2562,17 @@ func (do *Domain) StartTTLJobManager() {
 		ttlJobManager.Start()
 
 		<-do.exit
-
-		ttlJobManager.Stop()
-		err := ttlJobManager.WaitStopped(context.Background(), 30*time.Second)
-		if err != nil {
-			logutil.BgLogger().Warn("fail to wait until the ttl job manager stop", zap.Error(err))
-		}
 	}, "ttlJobManager")
 }
 
 // TTLJobManager returns the ttl job manager on this domain
 func (do *Domain) TTLJobManager() *ttlworker.JobManager {
 	return do.ttlJobManager.Load()
+}
+
+// StopAutoAnalyze stops (*Domain).autoAnalyzeWorker to launch new auto analyze jobs.
+func (do *Domain) StopAutoAnalyze() {
+	do.stopAutoAnalyze.Store(true)
 }
 
 func init() {

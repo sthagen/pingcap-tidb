@@ -28,8 +28,10 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/hack"
 	"github.com/pingcap/tidb/util/kvcache"
+	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/stmtsummary"
 	atomic2 "go.uber.org/atomic"
+	"go.uber.org/zap"
 	"golang.org/x/exp/maps"
 )
 
@@ -55,6 +57,13 @@ var (
 func Setup(cfg *Config) (err error) {
 	GlobalStmtSummary, err = NewStmtSummary(cfg)
 	return
+}
+
+// Close closes the GlobalStmtSummary.
+func Close() {
+	if GlobalStmtSummary != nil {
+		GlobalStmtSummary.Close()
+	}
 }
 
 // Config is the static configuration of StmtSummary. It cannot be
@@ -141,12 +150,6 @@ func NewStmtSummary4Test(maxStmtCount uint) *StmtSummary {
 		window:                 newStmtWindow(timeNow(), maxStmtCount),
 		storage:                &mockStmtStorage{},
 	}
-
-	ss.closeWg.Add(1)
-	go func() {
-		defer ss.closeWg.Done()
-		ss.rotateLoop()
-	}()
 
 	return ss
 }
@@ -309,6 +312,24 @@ func (s *StmtSummary) Close() {
 		s.closeWg.Wait()
 	}
 	s.closed.Store(true)
+	s.flush()
+}
+
+func (s *StmtSummary) flush() {
+	now := timeNow()
+
+	s.windowLock.Lock()
+	window := s.window
+	s.window = newStmtWindow(now, uint(s.MaxStmtCount()))
+	s.windowLock.Unlock()
+
+	if window.lru.Size() > 0 {
+		s.storage.persist(window, now)
+	}
+	err := s.storage.sync()
+	if err != nil {
+		logutil.BgLogger().Error("sync stmt summary failed", zap.Error(err))
+	}
 }
 
 // GetMoreThanCntBindableStmt is used to get bindable statements.
@@ -367,22 +388,26 @@ func (s *StmtSummary) rotateLoop() {
 		case <-tick.C:
 			now := timeNow()
 			s.windowLock.Lock()
-			w := s.window
 			// The current window has expired and needs to be refreshed and persisted.
-			if now.After(w.begin.Add(time.Duration(s.RefreshInterval()) * time.Second)) {
-				s.window = newStmtWindow(now, uint(s.MaxStmtCount()))
-				size := w.lru.Size()
-				if size > 0 {
-					// Persist window asynchronously.
-					s.closeWg.Add(1)
-					go func() {
-						defer s.closeWg.Done()
-						s.storage.persist(w, now)
-					}()
-				}
+			if now.After(s.window.begin.Add(time.Duration(s.RefreshInterval()) * time.Second)) {
+				s.rotate(now)
 			}
 			s.windowLock.Unlock()
 		}
+	}
+}
+
+func (s *StmtSummary) rotate(now time.Time) {
+	w := s.window
+	s.window = newStmtWindow(now, uint(s.MaxStmtCount()))
+	size := w.lru.Size()
+	if size > 0 {
+		// Persist window asynchronously.
+		s.closeWg.Add(1)
+		go func() {
+			defer s.closeWg.Done()
+			s.storage.persist(w, now)
+		}()
 	}
 }
 
@@ -418,6 +443,7 @@ func (w *stmtWindow) clear() {
 
 type stmtStorage interface {
 	persist(w *stmtWindow, end time.Time)
+	sync() error
 }
 
 // stmtKey defines key for stmtElement.
@@ -487,11 +513,18 @@ type lockedStmtRecord struct {
 }
 
 type mockStmtStorage struct {
+	sync.Mutex
 	windows []*stmtWindow
 }
 
 func (s *mockStmtStorage) persist(w *stmtWindow, _ time.Time) {
+	s.Lock()
 	s.windows = append(s.windows, w)
+	s.Unlock()
+}
+
+func (*mockStmtStorage) sync() error {
+	return nil
 }
 
 /* Public proxy functions between v1 and v2 */
