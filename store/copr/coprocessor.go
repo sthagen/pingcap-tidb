@@ -833,10 +833,10 @@ func (it *copIterator) open(ctx context.Context, enabledRateLimitAction, enableC
 			it.memTracker.Consume(10 * MockResponseSizeForTest)
 		}
 	})
-	go taskSender.run()
+	go taskSender.run(it.req.ConnID)
 }
 
-func (sender *copIteratorTaskSender) run() {
+func (sender *copIteratorTaskSender) run(connID uint64) {
 	// Send tasks to feed the worker goroutines.
 	for _, t := range sender.tasks {
 		// we control the sending rate to prevent all tasks
@@ -857,6 +857,9 @@ func (sender *copIteratorTaskSender) run() {
 		exit = sender.sendToTaskCh(t, sendTo)
 		if exit {
 			break
+		}
+		if connID > 0 {
+			failpoint.Inject("pauseCopIterTaskSender", func() {})
 		}
 	}
 	close(sender.taskCh)
@@ -1634,15 +1637,15 @@ func (worker *copIteratorWorker) handleCollectExecutionInfo(bo *Backoffer, rpcCt
 	td := util.TimeDetail{}
 	if pbDetails := resp.pbResp.ExecDetailsV2; pbDetails != nil {
 		// Take values in `ExecDetailsV2` first.
-		if timeDetail := pbDetails.TimeDetail; timeDetail != nil {
-			td.MergeFromTimeDetail(timeDetail)
+		if pbDetails.TimeDetail != nil || pbDetails.TimeDetailV2 != nil {
+			td.MergeFromTimeDetail(pbDetails.TimeDetailV2, pbDetails.TimeDetail)
 		}
 		if scanDetailV2 := pbDetails.ScanDetailV2; scanDetailV2 != nil {
 			sd.MergeFromScanDetailV2(scanDetailV2)
 		}
 	} else if pbDetails := resp.pbResp.ExecDetails; pbDetails != nil {
 		if timeDetail := pbDetails.TimeDetail; timeDetail != nil {
-			td.MergeFromTimeDetail(timeDetail)
+			td.MergeFromTimeDetail(nil, timeDetail)
 		}
 		if scanDetail := pbDetails.ScanDetail; scanDetail != nil {
 			if scanDetail.Write != nil {
