@@ -26,6 +26,7 @@ import (
 	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	driver "github.com/pingcap/tidb/types/parser_driver"
+	"github.com/pingcap/tidb/util/filter"
 	"github.com/pingcap/tidb/util/logutil"
 	"go.uber.org/zap"
 )
@@ -94,11 +95,16 @@ func (checker *cacheableChecker) Enter(in ast.Node) (out ast.Node, skipChildren 
 		}
 	case *ast.InsertStmt:
 		if node.Select == nil {
-			// do not cache insert-values-stmt like 'insert into t values (...)' since
-			// no performance benefit and to save memory.
-			checker.cacheable = false
-			checker.reason = "ignore insert-values-stmt"
-			return in, true
+			nRows := len(node.Lists)
+			nCols := 0
+			if len(node.Lists) > 0 { // avoid index-out-of-range
+				nCols = len(node.Lists[0])
+			}
+			if nRows*nCols > 200 { // to save memory
+				checker.cacheable = false
+				checker.reason = "too many values (more than 200) in the insert statement"
+				return in, true
+			}
 		}
 		for _, hints := range node.TableHints {
 			if hints.HintName.L == HintIgnorePlanCache {
@@ -322,6 +328,11 @@ func (checker *nonPreparedPlanCacheableChecker) Enter(in ast.Node) (out ast.Node
 		return in, !checker.cacheable
 	case *ast.TableName:
 		checker.tableNode = node
+		if filter.IsSystemSchema(node.Schema.O) {
+			checker.cacheable = false
+			checker.reason = "access tables in system schema"
+			return in, !checker.cacheable
+		}
 		if checker.schema != nil {
 			tb, err := checker.schema.TableByName(node.Schema, node.Name)
 			if err != nil {

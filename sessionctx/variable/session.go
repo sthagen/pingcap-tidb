@@ -842,6 +842,11 @@ type SessionVars struct {
 	// If we can't estimate the size of one side of join child, we will check if its row number exceeds this limitation.
 	BroadcastJoinThresholdCount int64
 
+	// PreferBCJByExchangeDataSize indicates the method used to choose mpp broadcast join
+	// false: choose mpp broadcast join by `BroadcastJoinThresholdSize` and `BroadcastJoinThresholdCount`
+	// true: compare data exchange size of join and choose the smallest one
+	PreferBCJByExchangeDataSize bool
+
 	// LimitPushDownThreshold determines if push Limit or TopN down to TiKV forcibly.
 	LimitPushDownThreshold int64
 
@@ -1378,9 +1383,6 @@ type SessionVars struct {
 
 	// Resource group name
 	ResourceGroupName string
-
-	// ProtectedTSList holds a list of timestamps that should delay GC.
-	ProtectedTSList protectedTSList
 
 	// PessimisticTransactionFairLocking controls whether fair locking for pessimistic transaction
 	// is enabled.
@@ -3309,54 +3311,4 @@ func (s *SessionVars) GetRelatedTableForMDL() *sync.Map {
 // EnableForceInlineCTE returns the session variable enableForceInlineCTE
 func (s *SessionVars) EnableForceInlineCTE() bool {
 	return s.enableForceInlineCTE
-}
-
-// protectedTSList implements util/processinfo#ProtectedTSList
-type protectedTSList struct {
-	sync.Mutex
-	items map[uint64]int
-}
-
-// HoldTS holds the timestamp to prevent its data from being GCed.
-func (lst *protectedTSList) HoldTS(ts uint64) (unhold func()) {
-	lst.Lock()
-	if lst.items == nil {
-		lst.items = map[uint64]int{}
-	}
-	lst.items[ts] += 1
-	lst.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			lst.Lock()
-			if lst.items != nil {
-				if lst.items[ts] > 1 {
-					lst.items[ts] -= 1
-				} else {
-					delete(lst.items, ts)
-				}
-			}
-			lst.Unlock()
-		})
-	}
-}
-
-// GetMinProtectedTS returns the minimum protected timestamp that greater than `lowerBound` (0 if no such one).
-func (lst *protectedTSList) GetMinProtectedTS(lowerBound uint64) (ts uint64) {
-	lst.Lock()
-	for k, v := range lst.items {
-		if v > 0 && k > lowerBound && (k < ts || ts == 0) {
-			ts = k
-		}
-	}
-	lst.Unlock()
-	return
-}
-
-// Size returns the number of protected timestamps (exported for test).
-func (lst *protectedTSList) Size() (size int) {
-	lst.Lock()
-	size = len(lst.items)
-	lst.Unlock()
-	return
 }
