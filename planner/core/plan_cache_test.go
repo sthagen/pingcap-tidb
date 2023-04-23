@@ -50,6 +50,26 @@ func TestInitLRUWithSystemVar(t *testing.T) {
 	require.NotNil(t, lru)
 }
 
+func TestIssue43311(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec(`use test`)
+	tk.MustExec(`create table test.t (id int, value decimal(7,4), c1 int, c2 int)`)
+	tk.MustExec(`insert into test.t values (1,1.9285,54,28), (1,1.9286,54,28)`)
+
+	tk.MustExec(`set session tidb_enable_non_prepared_plan_cache=0`)
+	tk.MustQuery(`select * from t where value = 54 / 28`).Check(testkit.Rows()) // empty
+
+	tk.MustExec(`set session tidb_enable_non_prepared_plan_cache=1`)
+	tk.MustQuery(`select * from t where value = 54 / 28`).Check(testkit.Rows()) // empty
+	tk.MustQuery(`select * from t where value = 54 / 28`).Check(testkit.Rows()) // empty
+
+	tk.MustExec(`prepare st from 'select * from t where value = ? / ?'`)
+	tk.MustExec(`set @a=54, @b=28`)
+	tk.MustQuery(`execute st using @a, @b`).Check(testkit.Rows()) // empty
+	tk.MustQuery(`execute st using @a, @b`).Check(testkit.Rows()) // empty
+}
+
 func TestPlanCacheUnsafeRange(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 	tk := testkit.NewTestKit(t, store)
@@ -101,6 +121,42 @@ func TestIssue40296(t *testing.T) {
 	tk.MustQuery(`select * from IDT_MULTI15880STROBJSTROBJ where col1 in ("aa", "aa") or col2 = -9605492323393070105 or col3 = "0005-06-22"`).Check(
 		testkit.Rows("ee -9605492323393070105 0850-03-15"))
 	tk.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("0")) // unary operator '-' is not supported now.
+}
+
+func TestNonPreparedPlanCacheDMLHints(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec(`use test`)
+	tk.MustExec(`create table t (a int)`)
+	tk.MustExec(`set @@tidb_enable_non_prepared_plan_cache=1`)
+	tk.MustExec(`set @@tidb_enable_non_prepared_plan_cache_for_dml=1`)
+
+	tk.MustExec(`insert into t values (1)`)
+	tk.MustExec(`insert into t values (1)`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+	tk.MustExec(`update t set a=1`)
+	tk.MustExec(`update t set a=1`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+	tk.MustExec(`delete from t where a=1`)
+	tk.MustExec(`delete from t where a=1`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+	tk.MustExec(`insert /*+ ignore_plan_cache() */ into t values (1)`)
+	tk.MustExec(`insert /*+ ignore_plan_cache() */ into t values (1)`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("0"))
+	tk.MustExec(`update /*+ ignore_plan_cache() */ t set a=1`)
+	tk.MustExec(`update /*+ ignore_plan_cache() */ t set a=1`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("0"))
+	tk.MustExec(`delete /*+ ignore_plan_cache() */ from t where a=1`)
+	tk.MustExec(`delete /*+ ignore_plan_cache() */ from t where a=1`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("0"))
+
+	tk.MustExec(`insert into t values (1)`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+	tk.MustExec(`update t set a=1`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+	tk.MustExec(`delete from t where a=1`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
 }
 
 func TestNonPreparedPlanCachePlanString(t *testing.T) {
@@ -1306,7 +1362,7 @@ func TestPlanCacheWithLimit(t *testing.T) {
 	tk.MustExec("prepare stmt from 'select * from t limit ?'")
 	tk.MustExec("set @a = 10001")
 	tk.MustExec("execute stmt using @a")
-	tk.MustQuery("show warnings").Check(testkit.Rows("Warning 1105 skip prepared plan-cache: limit count more than 10000"))
+	tk.MustQuery("show warnings").Check(testkit.Rows("Warning 1105 skip prepared plan-cache: limit count is too large"))
 }
 
 func TestPlanCacheMemoryTable(t *testing.T) {
@@ -1533,6 +1589,33 @@ func TestPlanCacheSubquerySPMEffective(t *testing.T) {
 		tk.MustExec("execute stmt using " + strings.Join(using, ", "))
 		tk.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("0"))
 	}
+}
+
+func TestNonPreparedPlanCacheDMLSwitch(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec(`use test`)
+	tk.MustExec("create table t (a int)")
+	tk.MustExec("set tidb_enable_non_prepared_plan_cache=1")
+
+	tk.MustExec("set tidb_enable_non_prepared_plan_cache_for_dml=0")
+	tk.MustExec(`insert into t values (1)`)
+	tk.MustExec(`insert into t values (1)`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("0"))
+	tk.MustExec(`select a from t where a < 2 for update`)
+	tk.MustExec(`select a from t where a < 2 for update`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("0"))
+	tk.MustExec(`set @x:=1`)
+	tk.MustExec(`set @x:=1`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("0"))
+
+	tk.MustExec("set tidb_enable_non_prepared_plan_cache_for_dml=1")
+	tk.MustExec(`insert into t values (1)`)
+	tk.MustExec(`insert into t values (1)`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+	tk.MustExec(`select a from t where a < 2 for update`)
+	tk.MustExec(`select a from t where a < 2 for update`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
 }
 
 func TestNonPreparedPlanCacheUnderscoreCharset(t *testing.T) {
@@ -1828,6 +1911,7 @@ func TestNonPreparedPlanCacheDML(t *testing.T) {
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
 	tk.MustExec(`set tidb_enable_non_prepared_plan_cache=1`)
+	tk.MustExec(`set tidb_enable_non_prepared_plan_cache_for_dml=1`)
 	tk.MustExec("create table t (a int default 0, b int default 0)")
 
 	for _, sql := range []string{
@@ -1883,6 +1967,7 @@ func TestNonPreparedPlanCacheMultiStmt(t *testing.T) {
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
 	tk.MustExec(`set tidb_enable_non_prepared_plan_cache=1`)
+	tk.MustExec(`set tidb_enable_non_prepared_plan_cache_for_dml=1`)
 	tk.MustExec("create table t (a int)")
 
 	tk.MustExec("update t set a=1 where a<10")
