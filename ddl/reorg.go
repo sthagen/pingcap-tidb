@@ -15,6 +15,7 @@
 package ddl
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"strconv"
@@ -49,9 +50,12 @@ import (
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/pingcap/tidb/util/sqlexec"
 	"github.com/pingcap/tipb/go-tipb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	atomicutil "go.uber.org/atomic"
 	"go.uber.org/zap"
 )
+
+const rowCountEtcdPath = "distAddIndex"
 
 // reorgCtx is for reorganization.
 type reorgCtx struct {
@@ -134,6 +138,49 @@ func (rc *reorgCtx) getRowCount() int64 {
 	return row
 }
 
+func getAndSetJobRowCnt(ctx context.Context, reorgInfo *reorgInfo, rc *reorgCtx, job *model.Job, client *clientv3.Client) int64 {
+	rowCount := int64(0)
+	if reorgInfo.Job.ReorgMeta.IsDistReorg && !reorgInfo.mergingTmpIdx {
+		path := fmt.Sprintf("%s/%d", rowCountEtcdPath, job.ID)
+		resp, err := client.Get(ctx, path, clientv3.WithPrefix())
+		if err != nil {
+			logutil.BgLogger().Warn("[ddl] get row count from ETCD failed", zap.Error(err))
+			return 0
+		}
+		if len(resp.Kvs) == 0 {
+			return 0
+		}
+		for _, kv := range resp.Kvs {
+			cnt, err := strconv.Atoi(string(kv.Value))
+			if err != nil {
+				logutil.BgLogger().Error("[ddl] parse row count from ETCD failed", zap.Error(err))
+				continue
+			}
+			rowCount += int64(cnt)
+		}
+		job.SetRowCount(rowCount)
+	} else {
+		rowCount = rc.getRowCount()
+		job.SetRowCount(rowCount)
+	}
+	return rowCount
+}
+
+func deleteETCDRowCntStatIfNecessary(ctx context.Context, reorgInfo *reorgInfo, job *model.Job, client *clientv3.Client) {
+	if reorgInfo.Job.ReorgMeta.IsDistReorg && !reorgInfo.mergingTmpIdx {
+		path := fmt.Sprintf("%s/%d", rowCountEtcdPath, job.ID)
+		const retryCnt = 3
+		for i := 0; i < retryCnt; i++ {
+			_, err := client.Delete(ctx, path, clientv3.WithPrefix())
+			if err != nil {
+				logutil.BgLogger().Warn("[ddl] delete row count from ETCD failed", zap.Error(err))
+			} else {
+				return
+			}
+		}
+	}
+}
+
 // runReorgJob is used as a portal to do the reorganization work.
 // eg:
 // 1: add index
@@ -199,6 +246,11 @@ func (w *worker) runReorgJob(rh *reorgHandler, reorgInfo *reorgInfo, tblInfo *mo
 			return dbterror.ErrCancelledDDLJob
 		}
 
+		err := overwriteReorgInfoFromCheckpoint(rh.s, job, reorgInfo)
+		if err != nil {
+			return err
+		}
+
 		rc = w.newReorgCtx(reorgInfo.Job.ID, reorgInfo.Job.GetRowCount())
 		w.wg.Add(1)
 		go func() {
@@ -225,15 +277,14 @@ func (w *worker) runReorgJob(rh *reorgHandler, reorgInfo *reorgInfo, tblInfo *mo
 			d.removeReorgCtx(job.ID)
 			return dbterror.ErrCancelledDDLJob
 		}
-
-		rowCount := rc.getRowCount()
+		rowCount := getAndSetJobRowCnt(w.ctx, reorgInfo, rc, job, d.etcdCli)
 		if err != nil {
 			logutil.BgLogger().Warn("[ddl] run reorg job done", zap.Int64("handled rows", rowCount), zap.Error(err))
 		} else {
 			logutil.BgLogger().Info("[ddl] run reorg job done", zap.Int64("handled rows", rowCount))
 		}
 
-		job.SetRowCount(rowCount)
+		deleteETCDRowCntStatIfNecessary(w.ctx, reorgInfo, job, d.etcdCli)
 
 		// Update a job's warnings.
 		w.mergeWarningsIntoJob(job)
@@ -254,8 +305,7 @@ func (w *worker) runReorgJob(rh *reorgHandler, reorgInfo *reorgInfo, tblInfo *mo
 		// We return dbterror.ErrWaitReorgTimeout here too, so that outer loop will break.
 		return dbterror.ErrWaitReorgTimeout
 	case <-time.After(waitTimeout):
-		rowCount := rc.getRowCount()
-		job.SetRowCount(rowCount)
+		rowCount := getAndSetJobRowCnt(w.ctx, reorgInfo, rc, job, d.etcdCli)
 		updateBackfillProgress(w, reorgInfo, tblInfo, rowCount)
 
 		// Update a job's warnings.
@@ -268,6 +318,19 @@ func (w *worker) runReorgJob(rh *reorgHandler, reorgInfo *reorgInfo, tblInfo *mo
 			zap.Int64("total added row count", rowCount))
 		// If timeout, we will return, check the owner and retry to wait job done again.
 		return dbterror.ErrWaitReorgTimeout
+	}
+	return nil
+}
+
+func overwriteReorgInfoFromCheckpoint(sess *sess.Session, job *model.Job, reorgInfo *reorgInfo) error {
+	start, end, pid, err := getCheckpointReorgHandle(sess, job)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if len(start) > 0 && len(end) > 0 && pid > 0 {
+		reorgInfo.StartKey = start
+		reorgInfo.EndKey = end
+		reorgInfo.PhysicalTableID = pid
 	}
 	return nil
 }
@@ -294,7 +357,7 @@ func updateBackfillProgress(w *worker, reorgInfo *reorgInfo, tblInfo *model.Tabl
 		if totalCount > 0 {
 			progress = float64(addedRowCount) / float64(totalCount)
 		} else {
-			progress = 1
+			progress = 0
 		}
 		if progress > 1 {
 			progress = 1
