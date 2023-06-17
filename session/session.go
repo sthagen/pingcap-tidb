@@ -644,7 +644,6 @@ func (s *session) doCommit(ctx context.Context) error {
 	s.txn.SetOption(kv.EnableAsyncCommit, sessVars.EnableAsyncCommit)
 	s.txn.SetOption(kv.Enable1PC, sessVars.Enable1PC)
 	s.txn.SetOption(kv.ResourceGroupTagger, sessVars.StmtCtx.GetResourceGroupTagger())
-	s.txn.SetOption(kv.ResourceGroupName, sessVars.ResourceGroupName)
 	if sessVars.StmtCtx.KvExecCounter != nil {
 		// Bind an interceptor for client-go to count the number of SQL executions of each TiKV.
 		s.txn.SetOption(kv.RPCInterceptor, sessVars.StmtCtx.KvExecCounter.RPCInterceptor())
@@ -1165,11 +1164,10 @@ func (*session) isTxnRetryableError(err error) bool {
 
 func (s *session) checkTxnAborted(stmt sqlexec.Statement) error {
 	var err error
-	if atomic.LoadUint32(&s.GetSessionVars().TxnCtx.LockExpire) > 0 {
-		err = kv.ErrLockExpire
-	} else {
+	if atomic.LoadUint32(&s.GetSessionVars().TxnCtx.LockExpire) == 0 {
 		return nil
 	}
+	err = kv.ErrLockExpire
 	// If the transaction is aborted, the following statements do not need to execute, except `commit` and `rollback`,
 	// because they are used to finish the aborted transaction.
 	if _, ok := stmt.(*executor.ExecStmt).StmtNode.(*ast.CommitStmt); ok {
@@ -1926,8 +1924,9 @@ func (s *session) ExecRestrictedStmt(ctx context.Context, stmtNode ast.StmtNode,
 		return nil, nil, err
 	}
 
-	for _, dbName := range GetDBNames(se.GetSessionVars()) {
-		metrics.QueryDurationHistogram.WithLabelValues(metrics.LblInternal, dbName).Observe(time.Since(startTime).Seconds())
+	vars := se.GetSessionVars()
+	for _, dbName := range GetDBNames(vars) {
+		metrics.QueryDurationHistogram.WithLabelValues(metrics.LblInternal, dbName, vars.ResourceGroupName).Observe(time.Since(startTime).Seconds())
 	}
 	return rows, rs.Fields(), err
 }
@@ -2101,8 +2100,9 @@ func (s *session) ExecRestrictedSQL(ctx context.Context, opts []sqlexec.OptionFu
 			return nil, nil, err
 		}
 
-		for _, dbName := range GetDBNames(se.GetSessionVars()) {
-			metrics.QueryDurationHistogram.WithLabelValues(metrics.LblInternal, dbName).Observe(time.Since(startTime).Seconds())
+		vars := se.GetSessionVars()
+		for _, dbName := range GetDBNames(vars) {
+			metrics.QueryDurationHistogram.WithLabelValues(metrics.LblInternal, dbName, vars.ResourceGroupName).Observe(time.Since(startTime).Seconds())
 		}
 		return rows, rs.Fields(), err
 	})
@@ -2200,10 +2200,10 @@ func (s *session) ExecuteStmt(ctx context.Context, stmtNode ast.StmtNode) (sqlex
 	stmt, err := compiler.Compile(ctx, stmtNode)
 	// session resource-group might be changed by query hint, ensure restore it back when
 	// the execution finished.
-	if s.GetSessionVars().ResourceGroupName != originalResourceGroup {
+	if sessVars.ResourceGroupName != originalResourceGroup {
 		defer func() {
 			// Restore the resource group for the session
-			s.GetSessionVars().ResourceGroupName = originalResourceGroup
+			sessVars.ResourceGroupName = originalResourceGroup
 		}()
 	}
 	if err != nil {
@@ -2467,6 +2467,11 @@ func (s *session) rollbackOnError(ctx context.Context) {
 
 // PrepareStmt is used for executing prepare statement in binary protocol
 func (s *session) PrepareStmt(sql string) (stmtID uint32, paramCount int, fields []*ast.ResultField, err error) {
+	defer func() {
+		if s.sessionVars.StmtCtx != nil {
+			s.sessionVars.StmtCtx.DetachMemDiskTracker()
+		}
+	}()
 	if s.sessionVars.TxnCtx.InfoSchema == nil {
 		// We don't need to create a transaction for prepare statement, just get information schema will do.
 		s.sessionVars.TxnCtx.InfoSchema = domain.GetDomain(s).InfoSchema()
@@ -2696,11 +2701,8 @@ func (s *session) Auth(user *auth.UserIdentity, authentication, salt []byte, aut
 		return err
 	}
 
-	// If tidb_resource_control_enable is disabled, set resource group to empty
-	if variable.EnableResourceControl.Load() {
+	if variable.EnableResourceControl.Load() && info.ResourceGroupName != "" {
 		s.sessionVars.ResourceGroupName = strings.ToLower(info.ResourceGroupName)
-	} else {
-		s.sessionVars.ResourceGroupName = ""
 	}
 
 	if info.InSandBoxMode {
@@ -2796,15 +2798,14 @@ func verifyAccountAutoLock(s *session, user, host string) (bool, error) {
 		}
 		lastChanged := pl.AutoLockedLastChanged
 		d := time.Now().Unix() - lastChanged
-		if d > lockTimeDay*24*60*60 {
-			// Generate unlock json string.
-			plJSON = privileges.BuildPasswordLockingJSON(pl.FailedLoginAttempts,
-				pl.PasswordLockTimeDays, "N", 0, time.Now().Format(time.UnixDate))
-		} else {
+		if d <= lockTimeDay*24*60*60 {
 			lds := strconv.FormatInt(lockTimeDay, 10)
 			rds := strconv.FormatInt(int64(math.Ceil(float64(lockTimeDay)-float64(d)/(24*60*60))), 10)
 			return false, privileges.GenerateAccountAutoLockErr(pl.FailedLoginAttempts, user, host, lds, rds)
 		}
+		// Generate unlock json string.
+		plJSON = privileges.BuildPasswordLockingJSON(pl.FailedLoginAttempts,
+			pl.PasswordLockTimeDays, "N", 0, time.Now().Format(time.UnixDate))
 	}
 	if plJSON != "" {
 		lockStatusChanged = true
@@ -3265,8 +3266,17 @@ func InitMDLVariable(store kv.Storage) error {
 	return err
 }
 
-// BootstrapSession runs the first time when the TiDB server start.
+// BootstrapSession bootstrap session and domain.
 func BootstrapSession(store kv.Storage) (*domain.Domain, error) {
+	return bootstrapSessionImpl(store, createSessions)
+}
+
+// BootstrapSession4DistExecution bootstrap session and dom for Distributed execution test, only for unit testing.
+func BootstrapSession4DistExecution(store kv.Storage) (*domain.Domain, error) {
+	return bootstrapSessionImpl(store, createSessions4DistExecution)
+}
+
+func bootstrapSessionImpl(store kv.Storage, createSessionsImpl func(store kv.Storage, cnt int) ([]*session, error)) (*domain.Domain, error) {
 	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnBootstrap)
 	cfg := config.GetGlobalConfig()
 	if len(cfg.Instance.PluginLoad) > 0 {
@@ -3304,7 +3314,7 @@ func BootstrapSession(store kv.Storage) (*domain.Domain, error) {
 
 	analyzeConcurrencyQuota := int(config.GetGlobalConfig().Performance.AnalyzePartitionConcurrencyQuota)
 	concurrency := int(config.GetGlobalConfig().Performance.StatsLoadConcurrency)
-	ses, err := createSessions(store, 10)
+	ses, err := createSessionsImpl(store, 10)
 	if err != nil {
 		return nil, err
 	}
@@ -3490,7 +3500,6 @@ func BootstrapSession(store kv.Storage) (*domain.Domain, error) {
 		dom.Close()
 		return nil, err
 	}
-
 	err = dom.InitDistTaskLoop(ctx)
 	if err != nil {
 		return nil, err
@@ -3523,13 +3532,27 @@ func runInBootstrapSession(store kv.Storage, bootstrap func(Session)) {
 
 	dom := domain.GetDomain(s)
 	dom.Close()
+	if intest.InTest {
+		infosync.MockGlobalServerInfoManagerEntry.Close()
+	}
 	domap.Delete(store)
 }
 
 func createSessions(store kv.Storage, cnt int) ([]*session, error) {
+	return createSessionsImpl(store, cnt, createSession)
+}
+
+func createSessions4DistExecution(store kv.Storage, cnt int) ([]*session, error) {
+	domap.Delete(store)
+
+	return createSessionsImpl(store, cnt, createSession4DistExecution)
+}
+
+func createSessionsImpl(store kv.Storage, cnt int, createSessionImpl func(kv.Storage) (*session, error)) ([]*session, error) {
+	// Then we can create new dom
 	ses := make([]*session, cnt)
 	for i := 0; i < cnt; i++ {
-		se, err := createSession(store)
+		se, err := createSessionImpl(store)
 		if err != nil {
 			return nil, err
 		}
@@ -3544,6 +3567,10 @@ func createSessions(store kv.Storage, cnt int) ([]*session, error) {
 // This means the min ts reporter is not aware of it and may report a wrong min start ts.
 // In most cases you should use a session pool in domain instead.
 func createSession(store kv.Storage) (*session, error) {
+	return createSessionWithOpt(store, nil)
+}
+
+func createSession4DistExecution(store kv.Storage) (*session, error) {
 	return createSessionWithOpt(store, nil)
 }
 

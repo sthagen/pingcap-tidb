@@ -890,6 +890,8 @@ const (
 	ErrWindowNoGroupOrderUnused                              = 3597
 	ErrWindowExplainJSON                                     = 3598
 	ErrWindowFunctionIgnoresFrame                            = 3599
+	ErrInvalidNumberOfArgs                                   = 3601
+	ErrFieldInGroupingNotGroupBy                             = 3602
 	ErrIllegalPrivilegeLevel                                 = 3619
 	ErrCTEMaxRecursionDepth                                  = 3636
 	ErrNotHintUpdatable                                      = 3637
@@ -1131,11 +1133,13 @@ const (
 	ErrPausedDDLJob       = 8262
 
 	// Resource group errors.
-	ErrResourceGroupExists            = 8248
-	ErrResourceGroupNotExists         = 8249
-	ErrResourceGroupSupportDisabled   = 8250
-	ErrResourceGroupConfigUnavailable = 8251
-	ErrResourceGroupThrottled         = 8252
+	ErrResourceGroupExists                  = 8248
+	ErrResourceGroupNotExists               = 8249
+	ErrResourceGroupSupportDisabled         = 8250
+	ErrResourceGroupConfigUnavailable       = 8251
+	ErrResourceGroupThrottled               = 8252
+	ErrResourceGroupQueryRunawayInterrupted = 8253
+	ErrResourceGroupQueryRunawayQuarantine  = 8254
 
 	// TiKV/PD/TiFlash errors.
 	ErrPDServerTimeout           = 9001
