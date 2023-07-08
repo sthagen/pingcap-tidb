@@ -32,7 +32,6 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/logutil"
-	"github.com/pingcap/tidb/util/mathutil"
 	"github.com/pingcap/tidb/util/sqlexec"
 	"go.uber.org/zap"
 )
@@ -273,7 +272,7 @@ func (h *Handle) initStatsHistograms(is infoschema.InfoSchema, cache *cache.Stat
 	return nil
 }
 
-func (h *Handle) initStatsTopN4Chunk(cache *cache.StatsCacheWrapper, iter *chunk.Iterator4Chunk) {
+func (*Handle) initStatsTopN4Chunk(cache *cache.StatsCacheWrapper, iter *chunk.Iterator4Chunk) {
 	affectedIndexes := make(map[*statistics.Index]struct{})
 	for row := iter.Begin(); row != iter.End(); row = iter.Next() {
 		table, ok := cache.Get(row.GetInt64(0))
@@ -320,7 +319,7 @@ func (h *Handle) initStatsTopN(cache *cache.StatsCacheWrapper) error {
 	return nil
 }
 
-func (h *Handle) initStatsFMSketch4Chunk(cache *cache.StatsCacheWrapper, iter *chunk.Iterator4Chunk) {
+func (*Handle) initStatsFMSketch4Chunk(cache *cache.StatsCacheWrapper, iter *chunk.Iterator4Chunk) {
 	for row := iter.Begin(); row != iter.End(); row = iter.Next() {
 		table, ok := cache.Get(row.GetInt64(0))
 		if !ok {
@@ -369,7 +368,7 @@ func (h *Handle) initStatsFMSketch(cache *cache.StatsCacheWrapper) error {
 	return nil
 }
 
-func (h *Handle) initStatsBuckets4Chunk(cache *cache.StatsCacheWrapper, iter *chunk.Iterator4Chunk) {
+func (*Handle) initStatsBuckets4Chunk(cache *cache.StatsCacheWrapper, iter *chunk.Iterator4Chunk) {
 	for row := iter.Begin(); row != iter.End(); row = iter.Next() {
 		tableID, isIndex, histID := row.GetInt64(0), row.GetInt64(1), row.GetInt64(2)
 		table, ok := cache.Get(tableID)
@@ -437,9 +436,7 @@ func (h *Handle) initStatsBuckets(cache *cache.StatsCacheWrapper) error {
 		}
 		h.initStatsBuckets4Chunk(cache, iter)
 	}
-	lastVersion := uint64(0)
 	for _, table := range cache.Values() {
-		lastVersion = mathutil.Max(lastVersion, table.Version)
 		for _, idx := range table.Indices {
 			for i := 1; i < idx.Len(); i++ {
 				idx.Buckets[i].Count += idx.Buckets[i-1].Count
@@ -453,7 +450,6 @@ func (h *Handle) initStatsBuckets(cache *cache.StatsCacheWrapper) error {
 			col.PreCalculateScalar()
 		}
 	}
-	cache.SetVersion(lastVersion)
 	return nil
 }
 
@@ -479,11 +475,6 @@ func (h *Handle) InitStatsLite(is infoschema.InfoSchema) (err error) {
 	if err != nil {
 		return errors.Trace(err)
 	}
-	lastVersion := uint64(0)
-	for _, table := range cache.Values() {
-		lastVersion = mathutil.Max(lastVersion, table.Version)
-	}
-	cache.SetVersion(lastVersion)
 	cache.FreshMemUsage()
 	h.updateStatsCache(cache)
 	return nil
