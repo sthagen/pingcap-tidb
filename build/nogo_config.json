@@ -220,6 +220,7 @@
   "forcetypeassert": {
     "exclude_files": {
       "parser/parser.go": "parser/parser.go code",
+      ".*test_/testmain\\.go$": "ignore generated code",
       "external/": "no need to vet third party code",
       ".*_generated\\.go$": "ignore generated code"
     },
@@ -501,6 +502,7 @@
       "executor/aggregate.go": "executor/aggregate.go",
       "executor/analyze": "executor/analyze",
       "executor/change.go": "executor/change.go",
+      "executor/concurrent_map.go": "executor/concurrent_map.go",
       "executor/internal/": "executor/internal/",
       "executor/aggfuncs/": "executor/aggfuncs/",
       "executor/asyncloaddata/": "executor/asyncloaddata/",
