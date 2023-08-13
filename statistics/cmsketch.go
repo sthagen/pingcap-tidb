@@ -42,7 +42,7 @@ import (
 	"golang.org/x/exp/slices"
 )
 
-// topNThreshold is the minimum ratio of the number of topn elements in CMSketch, 10 means 1 / 10 = 10%.
+// topNThreshold is the minimum ratio of the number of topN elements in CMSketch, 10 means 1 / 10 = 10%.
 const topNThreshold = uint64(10)
 
 var (
@@ -53,11 +53,11 @@ var (
 // CMSketch is used to estimate point queries.
 // Refer: https://en.wikipedia.org/wiki/Count-min_sketch
 type CMSketch struct {
-	depth        int32
-	width        int32
+	table        [][]uint32
 	count        uint64 // TopN is not counted in count
 	defaultValue uint64 // In sampled data, if cmsketch returns a small value (less than avg value / 2), then this will returned.
-	table        [][]uint32
+	depth        int32
+	width        int32
 }
 
 // NewCMSketch returns a new CM sketch.
@@ -80,8 +80,8 @@ func NewCMSketch(d, w int32) *CMSketch {
 
 // topNHelper wraps some variables used when building cmsketch with top n.
 type topNHelper struct {
-	sampleSize    uint64
 	sorted        []dataCnt
+	sampleSize    uint64
 	onlyOnceItems uint64
 	sumTopN       uint64
 	actualNumTop  uint32
@@ -133,7 +133,7 @@ func newTopNHelper(sample [][]byte, numTop uint32) *topNHelper {
 		sumTopN += sorted[actualNumTop].cnt
 	}
 
-	return &topNHelper{uint64(len(sample)), sorted, onlyOnceItems, sumTopN, actualNumTop}
+	return &topNHelper{sorted, uint64(len(sample)), onlyOnceItems, sumTopN, actualNumTop}
 }
 
 // NewCMSketchAndTopN returns a new CM sketch with TopN elements, the estimate NDV and the scale ratio.
@@ -795,28 +795,18 @@ func NewTopN(n int) *TopN {
 //  2. `[]TopNMeta` is the left topN value from the partition-level TopNs, but is not placed to global-level TopN. We should put them back to histogram latter.
 //  3. `[]*Histogram` are the partition-level histograms which just delete some values when we merge the global-level topN.
 func MergePartTopN2GlobalTopN(loc *time.Location, version int, topNs []*TopN, n uint32, hists []*Histogram,
-	isIndex bool, kiiled *uint32) (*TopN, []TopNMeta, []*Histogram, error) {
+	isIndex bool, killed *uint32) (*TopN, []TopNMeta, []*Histogram, error) {
 	if checkEmptyTopNs(topNs) {
 		return nil, nil, hists, nil
 	}
-
 	partNum := len(topNs)
-	topNsNum := make([]int, partNum)
-	removeVals := make([][]TopNMeta, partNum)
-	for i, topN := range topNs {
-		if topN == nil {
-			topNsNum[i] = 0
-			continue
-		}
-		topNsNum[i] = len(topN.TopN)
-	}
 	// Different TopN structures may hold the same value, we have to merge them.
 	counter := make(map[hack.MutableString]float64)
 	// datumMap is used to store the mapping from the string type to datum type.
 	// The datum is used to find the value in the histogram.
 	datumMap := make(map[hack.MutableString]types.Datum)
 	for i, topN := range topNs {
-		if atomic.LoadUint32(kiiled) == 1 {
+		if atomic.LoadUint32(killed) == 1 {
 			return nil, nil, nil, errors.Trace(ErrQueryInterrupted)
 		}
 		if topN.TotalCount() == 0 {
@@ -834,6 +824,9 @@ func MergePartTopN2GlobalTopN(loc *time.Location, version int, topNs []*TopN, n 
 			// 1. Check the topN first.
 			// 2. If the topN doesn't contain the value corresponding to encodedVal. We should check the histogram.
 			for j := 0; j < partNum; j++ {
+				if atomic.LoadUint32(killed) == 1 {
+					return nil, nil, nil, errors.Trace(ErrQueryInterrupted)
+				}
 				if (j == i && version >= 2) || topNs[j].findTopN(val.Encoded) != -1 {
 					continue
 				}
@@ -849,7 +842,7 @@ func MergePartTopN2GlobalTopN(loc *time.Location, version int, topNs []*TopN, n 
 					} else {
 						var err error
 						if types.IsTypeTime(hists[0].Tp.GetType()) {
-							// handle datetime values specially since they are encoded to int and we'll get int values if using DecodeOne.
+							// Handle date time values specially since they are encoded to int and we'll get int values if using DecodeOne.
 							_, d, err = codec.DecodeAsDateTime(val.Encoded, hists[0].Tp.GetType(), loc)
 						} else if types.IsTypeFloat(hists[0].Tp.GetType()) {
 							_, d, err = codec.DecodeAsFloat32(val.Encoded, hists[0].Tp.GetType())
@@ -868,20 +861,9 @@ func MergePartTopN2GlobalTopN(loc *time.Location, version int, topNs []*TopN, n 
 				if count != 0 {
 					counter[encodedVal] += count
 					// Remove the value corresponding to encodedVal from the histogram.
-					removeVals[j] = append(removeVals[j], TopNMeta{Encoded: datum.GetBytes(), Count: uint64(count)})
+					hists[j].BinarySearchRemoveVal(TopNMeta{Encoded: datum.GetBytes(), Count: uint64(count)})
 				}
 			}
-		}
-	}
-	// Remove the value from the Hists.
-	for i := 0; i < partNum; i++ {
-		if len(removeVals[i]) > 0 {
-			tmp := removeVals[i]
-			slices.SortFunc(tmp, func(i, j TopNMeta) bool {
-				cmpResult := bytes.Compare(i.Encoded, j.Encoded)
-				return cmpResult < 0
-			})
-			hists[i].RemoveVals(tmp)
 		}
 	}
 	numTop := len(counter)
