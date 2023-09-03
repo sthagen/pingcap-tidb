@@ -27,6 +27,7 @@ import (
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/stretchr/testify/require"
+	"github.com/tiancaiamao/gp"
 )
 
 // cmd: go test -run=^$ -bench=BenchmarkMergePartTopN2GlobalTopNWithHists -benchmem github.com/pingcap/tidb/statistics
@@ -123,10 +124,7 @@ func benchmarkMergeGlobalStatsTopNByConcurrencyWithHists(partitions int, b *test
 		h.Buckets = append(h.Buckets, statistics.Bucket{Repeat: 10, Count: 40})
 		hists = append(hists, h)
 	}
-	wrapper := &statistics.StatsWrapper{
-		AllTopN: topNs,
-		AllHg:   hists,
-	}
+	wrapper := statistics.NewStatsWrapper(hists, topNs)
 	const mergeConcurrency = 4
 	batchSize := len(wrapper.AllTopN) / mergeConcurrency
 	if batchSize < 1 {
@@ -134,15 +132,17 @@ func benchmarkMergeGlobalStatsTopNByConcurrencyWithHists(partitions int, b *test
 	} else if batchSize > handle.MaxPartitionMergeBatchSize {
 		batchSize = handle.MaxPartitionMergeBatchSize
 	}
+	gpool := gp.New(mergeConcurrency, 5*time.Minute)
+	defer gpool.Close()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// Benchmark merge 10 topN.
-		_, _, _, _ = handle.MergeGlobalStatsTopNByConcurrency(mergeConcurrency, batchSize, wrapper, loc, version, 10, false, &isKilled)
+		_, _, _, _ = handle.MergeGlobalStatsTopNByConcurrency(gpool, mergeConcurrency, batchSize, wrapper, loc, version, 10, false, &isKilled)
 	}
 }
 
 var benchmarkSizes = []int{100, 1000, 10000, 100000, 1000000, 10000000}
-var benchmarkConcurrencySizes = []int{100, 1000, 10000, 100000, 1000000, 10000000, 100000000}
+var benchmarkConcurrencySizes = []int{100, 1000, 10000, 100000}
 
 func BenchmarkMergePartTopN2GlobalTopNWithHists(b *testing.B) {
 	for _, size := range benchmarkSizes {
