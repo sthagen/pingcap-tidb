@@ -31,7 +31,6 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/bindinfo"
 	"github.com/pingcap/tidb/config"
-	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/domain/infosync"
 	"github.com/pingcap/tidb/expression"
@@ -583,6 +582,11 @@ const (
 		key(state),
       	UNIQUE KEY task_key(task_key)
 	);`
+	// CreateDistFrameworkMeta create a system table that distributed task framework use to store meta information
+	CreateDistFrameworkMeta = `CREATE TABLE IF NOT EXISTS mysql.dist_framework_meta (
+        host VARCHAR(100) NOT NULL PRIMARY KEY,
+        role VARCHAR(64),
+        keyspace_id bigint(8) NOT NULL DEFAULT -1);`
 
 	// CreateLoadDataJobs is a table that LOAD DATA uses
 	CreateLoadDataJobs = `CREATE TABLE IF NOT EXISTS mysql.load_data_jobs (
@@ -974,11 +978,13 @@ const (
 	//   create table `mysql.tidb_runaway_watch` and table `mysql.tidb_runaway_watch_done`
 	//   to persist runaway watch and deletion of runaway watch at 7.3.
 	version172 = 172
+	// version 173 add column `summary` to `mysql.tidb_background_subtask`.
+	version173 = 173
 )
 
 // currentBootstrapVersion is defined as a variable, so we can modify its value for testing.
 // please make sure this is the largest version
-var currentBootstrapVersion int64 = version172
+var currentBootstrapVersion int64 = version173
 
 // DDL owner key's expired time is ManagerSessionTTL seconds, we should wait the time and give more time to have a chance to finish it.
 var internalSQLTimeout = owner.ManagerSessionTTL + 15
@@ -1119,6 +1125,7 @@ var (
 		upgradeToVer170,
 		upgradeToVer171,
 		upgradeToVer172,
+		upgradeToVer173,
 	}
 )
 
@@ -1177,12 +1184,9 @@ func getTiDBVar(s Session, name string) (sVal string, isNull bool, e error) {
 }
 
 var (
-	// SupportUpgradeStateVer is exported for testing.
-	// The minimum version that can be upgraded by paused user DDL.
-	SupportUpgradeStateVer int64 = version145
 	// SupportUpgradeHTTPOpVer is exported for testing.
-	// The minimum version of the upgrade can be notified through the HTTP API.
-	SupportUpgradeHTTPOpVer int64 = version172
+	// The minimum version of the upgrade by paused user DDL can be notified through the HTTP API.
+	SupportUpgradeHTTPOpVer int64 = version173
 )
 
 // upgrade function  will do some upgrade works, when the system is bootstrapped by low version TiDB server
@@ -1194,9 +1198,7 @@ func upgrade(s Session) {
 		// It is already bootstrapped/upgraded by a higher version TiDB server.
 		return
 	}
-	if ver >= SupportUpgradeStateVer {
-		checkOrSyncUpgrade(s, ver)
-	}
+	printClusterState(s, ver)
 
 	// Only upgrade from under version92 and this TiDB is not owner set.
 	// The owner in older tidb does not support concurrent DDL, we should add the internal DDL to job queue.
@@ -2557,8 +2559,8 @@ func upgradeToVer136(s Session, ver int64) {
 		return
 	}
 	mustExecute(s, CreateGlobalTask)
-	doReentrantDDL(s, fmt.Sprintf("ALTER TABLE mysql.%s DROP INDEX namespace", ddl.BackgroundSubtaskTable), dbterror.ErrCantDropFieldOrKey)
-	doReentrantDDL(s, fmt.Sprintf("ALTER TABLE mysql.%s ADD INDEX idx_task_key(task_key)", ddl.BackgroundSubtaskTable), dbterror.ErrDupKeyName)
+	doReentrantDDL(s, "ALTER TABLE mysql.tidb_background_subtask DROP INDEX namespace", dbterror.ErrCantDropFieldOrKey)
+	doReentrantDDL(s, "ALTER TABLE mysql.tidb_background_subtask ADD INDEX idx_task_key(task_key)", dbterror.ErrDupKeyName)
 }
 
 func upgradeToVer137(_ Session, _ int64) {
@@ -2712,6 +2714,13 @@ func upgradeToVer172(s Session, ver int64) {
 	mustExecute(s, CreateDoneRunawayWatchTable)
 }
 
+func upgradeToVer173(s Session, ver int64) {
+	if ver >= version173 {
+		return
+	}
+	doReentrantDDL(s, "ALTER TABLE mysql.tidb_background_subtask ADD COLUMN `summary` JSON", infoschema.ErrColumnExists)
+}
+
 func writeOOMAction(s Session) {
 	comment := "oom-action is `log` by default in v3.0.x, `cancel` by default in v4.0.11+"
 	mustExecute(s, `INSERT HIGH_PRIORITY INTO %n.%n VALUES (%?, %?, %?) ON DUPLICATE KEY UPDATE VARIABLE_VALUE= %?`,
@@ -2837,6 +2846,8 @@ func doDDLWorks(s Session) {
 	mustExecute(s, CreateTimers)
 	// create runaway_watch done
 	mustExecute(s, CreateDoneRunawayWatchTable)
+	// create dist_framework_meta
+	mustExecute(s, CreateDistFrameworkMeta)
 }
 
 // doBootstrapSQLFile executes SQL commands in a file as the last stage of bootstrap.
@@ -2958,7 +2969,6 @@ func doDMLWorks(s Session) {
 	mustExecute(s, `INSERT HIGH_PRIORITY INTO %n.%n VALUES(%?, %?, "Bootstrap version. Do not delete.")`,
 		mysql.SystemDB, mysql.TiDBTable, tidbServerVersionVar, currentBootstrapVersion,
 	)
-
 	writeSystemTZ(s)
 
 	writeNewCollationParameter(s, config.GetGlobalConfig().NewCollationsEnabledOnFirstBootstrap)
