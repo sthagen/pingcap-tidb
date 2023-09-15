@@ -28,6 +28,7 @@ import (
 	"github.com/pingcap/tidb/br/pkg/lightning/checkpoints"
 	"github.com/pingcap/tidb/br/pkg/lightning/common"
 	"github.com/pingcap/tidb/br/pkg/lightning/config"
+	"github.com/pingcap/tidb/br/pkg/lightning/metric"
 	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/pingcap/tidb/disttask/framework/dispatcher"
 	"github.com/pingcap/tidb/disttask/framework/handle"
@@ -190,8 +191,8 @@ func (dsp *ImportDispatcherExt) unregisterTask(ctx context.Context, task *proto.
 	}
 }
 
-// OnNextStage implements dispatcher.Extension interface.
-func (dsp *ImportDispatcherExt) OnNextStage(ctx context.Context, handle dispatcher.TaskHandle, gTask *proto.Task) (
+// OnNextSubtasksBatch generate batch of next stage's plan.
+func (dsp *ImportDispatcherExt) OnNextSubtasksBatch(ctx context.Context, taskHandle dispatcher.TaskHandle, gTask *proto.Task) (
 	resSubtaskMeta [][]byte, err error) {
 	logger := logutil.BgLogger().With(
 		zap.String("type", gTask.Type),
@@ -203,18 +204,18 @@ func (dsp *ImportDispatcherExt) OnNextStage(ctx context.Context, handle dispatch
 	if err != nil {
 		return nil, err
 	}
-	logger.Info("on next stage")
+	logger.Info("on next subtasks batch")
 
 	defer func() {
 		// currently, framework will take the task as finished when err is not nil or resSubtaskMeta is empty.
 		taskFinished := err == nil && len(resSubtaskMeta) == 0
 		if taskFinished {
 			// todo: we're not running in a transaction with task update
-			if err2 := dsp.finishJob(ctx, logger, handle, gTask, taskMeta); err2 != nil {
+			if err2 := dsp.finishJob(ctx, logger, taskHandle, gTask, taskMeta); err2 != nil {
 				err = err2
 			}
 		} else if err != nil && !dsp.IsRetryableErr(err) {
-			if err2 := dsp.failJob(ctx, handle, gTask, taskMeta, logger, err.Error()); err2 != nil {
+			if err2 := dsp.failJob(ctx, taskHandle, gTask, taskMeta, logger, err.Error()); err2 != nil {
 				// todo: we're not running in a transaction with task update, there might be case
 				// failJob return error, but task update succeed.
 				logger.Error("call failJob failed", zap.Error(err2))
@@ -222,17 +223,17 @@ func (dsp *ImportDispatcherExt) OnNextStage(ctx context.Context, handle dispatch
 		}
 	}()
 
-	var nextStep int64
 	switch gTask.Step {
 	case proto.StepInit:
-		if err := preProcess(ctx, handle, gTask, taskMeta, logger); err != nil {
+		if metrics, ok := metric.GetCommonMetric(ctx); ok {
+			metrics.BytesCounter.WithLabelValues(metric.StateTotalRestore).Add(float64(taskMeta.Plan.TotalFileSize))
+		}
+		if err := preProcess(ctx, taskHandle, gTask, taskMeta, logger); err != nil {
 			return nil, err
 		}
-		if err = startJob(ctx, logger, handle, taskMeta); err != nil {
+		if err = startJob(ctx, logger, taskHandle, taskMeta); err != nil {
 			return nil, err
 		}
-		logger.Info("move to import step")
-		nextStep = StepImport
 	case StepImport:
 		dsp.switchTiKV2NormalMode(ctx, gTask, logger)
 		failpoint.Inject("clearLastSwitchTime", func() {
@@ -244,18 +245,17 @@ func (dsp *ImportDispatcherExt) OnNextStage(ctx context.Context, handle dispatch
 		failpoint.Inject("failWhenDispatchPostProcessSubtask", func() {
 			failpoint.Return(nil, errors.New("injected error after StepImport"))
 		})
-		if err := updateResult(handle, gTask, taskMeta); err != nil {
+		if err := updateResult(taskHandle, gTask, taskMeta); err != nil {
 			return nil, err
 		}
 		logger.Info("move to post-process step ", zap.Any("result", taskMeta.Result))
-		nextStep = StepPostProcess
 	case StepPostProcess:
 		return nil, nil
 	default:
 		return nil, errors.Errorf("unknown step %d", gTask.Step)
 	}
 
-	previousSubtaskMetas, err := handle.GetPreviousSubtaskMetas(gTask.ID, gTask.Step)
+	previousSubtaskMetas, err := taskHandle.GetPreviousSubtaskMetas(gTask.ID, gTask.Step)
 	if err != nil {
 		return nil, err
 	}
@@ -268,12 +268,11 @@ func (dsp *ImportDispatcherExt) OnNextStage(ctx context.Context, handle dispatch
 	if err != nil {
 		return nil, err
 	}
-	metaBytes, err := physicalPlan.ToSubtaskMetas(planCtx, nextStep)
+	metaBytes, err := physicalPlan.ToSubtaskMetas(planCtx, dsp.GetNextStep(gTask))
 	if err != nil {
 		return nil, err
 	}
-	gTask.Step = nextStep
-	logger.Info("generate subtasks", zap.Int64("step", nextStep), zap.Int("subtask-count", len(metaBytes)))
+	logger.Info("generate subtasks", zap.Int("subtask-count", len(metaBytes)))
 	return metaBytes, nil
 }
 
@@ -335,6 +334,19 @@ func (*ImportDispatcherExt) IsRetryableErr(error) bool {
 	return false
 }
 
+// GetNextStep implements dispatcher.Extension interface.
+func (*ImportDispatcherExt) GetNextStep(task *proto.Task) int64 {
+	switch task.Step {
+	case proto.StepInit:
+		return StepImport
+	case StepImport:
+		return StepPostProcess
+	default:
+		// current step must be StepPostProcess
+		return proto.StepDone
+	}
+}
+
 func (dsp *ImportDispatcherExt) switchTiKV2NormalMode(ctx context.Context, task *proto.Task, logger *zap.Logger) {
 	dsp.updateCurrentTask(task)
 	if dsp.disableTiKVImportMode.Load() {
@@ -372,11 +384,18 @@ type importDispatcher struct {
 
 func newImportDispatcher(ctx context.Context, taskMgr *storage.TaskManager,
 	serverID string, task *proto.Task) dispatcher.Dispatcher {
+	metrics := metricsManager.getOrCreateMetrics(task.ID)
+	subCtx := metric.WithCommonMetric(ctx, metrics)
 	dis := importDispatcher{
-		BaseDispatcher: dispatcher.NewBaseDispatcher(ctx, taskMgr, serverID, task),
+		BaseDispatcher: dispatcher.NewBaseDispatcher(subCtx, taskMgr, serverID, task),
 	}
 	dis.BaseDispatcher.Extension = &ImportDispatcherExt{}
 	return &dis
+}
+
+func (dsp *importDispatcher) Close() {
+	metricsManager.unregister(dsp.Task.ID)
+	dsp.BaseDispatcher.Close()
 }
 
 // preProcess does the pre-processing for the task.
@@ -463,6 +482,7 @@ func updateMeta(gTask *proto.Task, taskMeta *TaskMeta) error {
 		return err
 	}
 	gTask.Meta = bs
+
 	return nil
 }
 
@@ -620,8 +640,6 @@ func rollback(ctx context.Context, handle dispatcher.TaskHandle, gTask *proto.Ta
 
 func stepStr(step int64) string {
 	switch step {
-	case proto.StepInit:
-		return "init"
 	case StepImport:
 		return "import"
 	case StepPostProcess:
