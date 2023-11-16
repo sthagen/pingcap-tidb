@@ -317,6 +317,8 @@ func (b *executorBuilder) build(p plannercore.Plan) exec.Executor {
 		return b.buildCTETableReader(v)
 	case *plannercore.CompactTable:
 		return b.buildCompactTable(v)
+	case *plannercore.AdminShowBDRRole:
+		return b.buildAdminShowBDRRole(v)
 	default:
 		if mp, ok := p.(MockPhysicalPlan); ok {
 			return mp.GetExecutor()
@@ -2123,7 +2125,8 @@ func (b *executorBuilder) buildMemTable(v *plannercore.PhysicalMemTable) exec.Ex
 			strings.ToLower(infoschema.ClusterTableMemoryUsageOpsHistory),
 			strings.ToLower(infoschema.TableResourceGroups),
 			strings.ToLower(infoschema.TableRunawayWatches),
-			strings.ToLower(infoschema.TableCheckConstraints):
+			strings.ToLower(infoschema.TableCheckConstraints),
+			strings.ToLower(infoschema.TableTiDBCheckConstraints):
 			return &MemTableReaderExec{
 				BaseExecutor: exec.NewBaseExecutor(b.ctx, v.Schema(), v.ID()),
 				table:        v.Table,
@@ -5487,4 +5490,8 @@ func (b *executorBuilder) buildCompactTable(v *plannercore.CompactTable) exec.Ex
 		partitionIDs: partitionIDs,
 		tikvStore:    tikvStore,
 	}
+}
+
+func (b *executorBuilder) buildAdminShowBDRRole(v *plannercore.AdminShowBDRRole) exec.Executor {
+	return &AdminShowBDRRoleExec{BaseExecutor: exec.NewBaseExecutor(b.ctx, v.Schema(), v.ID())}
 }
