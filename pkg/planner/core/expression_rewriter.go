@@ -41,6 +41,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/codec"
 	"github.com/pingcap/tidb/pkg/util/collate"
+	"github.com/pingcap/tidb/pkg/util/dbterror/plannererrors"
 	"github.com/pingcap/tidb/pkg/util/hint"
 	"github.com/pingcap/tidb/pkg/util/intest"
 	"github.com/pingcap/tidb/pkg/util/sem"
@@ -50,8 +51,8 @@ import (
 // EvalSubqueryFirstRow evaluates incorrelated subqueries once, and get first row.
 var EvalSubqueryFirstRow func(ctx context.Context, p PhysicalPlan, is infoschema.InfoSchema, sctx sessionctx.Context) (row []types.Datum, err error)
 
-// evalAstExpr evaluates ast expression directly.
-func evalAstExpr(sctx sessionctx.Context, expr ast.ExprNode) (types.Datum, error) {
+// evalAstExprWithPlanCtx evaluates ast expression with plan context.
+func evalAstExprWithPlanCtx(sctx sessionctx.Context, expr ast.ExprNode) (types.Datum, error) {
 	if val, ok := expr.(*driver.ValueExpr); ok {
 		return val.Datum, nil
 	}
@@ -60,6 +61,18 @@ func evalAstExpr(sctx sessionctx.Context, expr ast.ExprNode) (types.Datum, error
 		return types.Datum{}, err
 	}
 	return newExpr.Eval(sctx, chunk.Row{})
+}
+
+// evalAstExpr evaluates ast expression directly.
+func evalAstExpr(ctx sessionctx.Context, expr ast.ExprNode) (types.Datum, error) {
+	if val, ok := expr.(*driver.ValueExpr); ok {
+		return val.Datum, nil
+	}
+	newExpr, err := buildExprWithAst(ctx, expr)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	return newExpr.Eval(ctx, chunk.Row{})
 }
 
 // rewriteAstExpr rewrites ast expression directly.
@@ -470,7 +483,7 @@ func (er *expressionRewriter) Enter(inNode ast.Node) (ast.Node, bool) {
 				er.ctxStackAppend(col, types.EmptyName)
 				return inNode, true
 			}
-			er.err = ErrInvalidGroupFuncUse
+			er.err = plannererrors.ErrInvalidGroupFuncUse
 			return inNode, true
 		})
 	case *ast.ColumnNameExpr:
@@ -534,7 +547,7 @@ func (er *expressionRewriter) Enter(inNode ast.Node) (ast.Node, bool) {
 				return inNode, false
 			}
 			if idx < 0 {
-				er.err = ErrUnknownColumn.GenWithStackByArgs(v.Column.Name.OrigColName(), "field list")
+				er.err = plannererrors.ErrUnknownColumn.GenWithStackByArgs(v.Column.Name.OrigColName(), "field list")
 				return inNode, false
 			}
 			col := schema.Columns[idx]
@@ -549,7 +562,7 @@ func (er *expressionRewriter) Enter(inNode ast.Node) (ast.Node, bool) {
 				index, ok = planCtx.windowMap[v]
 			}
 			if !ok {
-				er.err = ErrWindowInvalidWindowFuncUse.GenWithStackByArgs(strings.ToLower(v.Name))
+				er.err = plannererrors.ErrWindowInvalidWindowFuncUse.GenWithStackByArgs(strings.ToLower(v.Name))
 				return inNode, true
 			}
 			er.ctxStackAppend(er.schema.Columns[index], er.names[index])
@@ -653,8 +666,8 @@ func (er *expressionRewriter) handleCompareSubquery(ctx context.Context, planCtx
 
 	noDecorrelate := hintFlags&hint.HintFlagNoDecorrelate > 0
 	if noDecorrelate && len(extractCorColumnsBySchema4LogicalPlan(np, planCtx.plan.Schema())) == 0 {
-		er.sctx.GetSessionVars().StmtCtx.SetHintWarning(ErrInternal.FastGen(
-			"NO_DECORRELATE() is inapplicable because there are no correlated columns."))
+		er.sctx.GetSessionVars().StmtCtx.SetHintWarning(
+			"NO_DECORRELATE() is inapplicable because there are no correlated columns.")
 		noDecorrelate = false
 	}
 
@@ -738,7 +751,7 @@ func (er *expressionRewriter) handleCompareSubquery(ctx context.Context, planCtx
 // it will be rewrote to t.id < (select max(s.id) from s).
 func (er *expressionRewriter) handleOtherComparableSubq(planCtx *exprRewriterPlanCtx, lexpr, rexpr expression.Expression, np LogicalPlan, useMin bool, cmpFunc string, all, markNoDecorrelate bool) {
 	intest.AssertNotNil(planCtx)
-	plan4Agg := LogicalAggregation{}.Init(er.sctx, planCtx.builder.getSelectOffset())
+	plan4Agg := LogicalAggregation{}.Init(planCtx.builder.ctx, planCtx.builder.getSelectOffset())
 	if hint := planCtx.builder.TableHints(); hint != nil {
 		plan4Agg.aggHints = hint.Agg
 	}
@@ -749,7 +762,7 @@ func (er *expressionRewriter) handleOtherComparableSubq(planCtx *exprRewriterPla
 	if useMin {
 		funcName = ast.AggFuncMin
 	}
-	funcMaxOrMin, err := aggregation.NewAggFuncDesc(er.sctx, funcName, []expression.Expression{rexpr}, false)
+	funcMaxOrMin, err := aggregation.NewAggFuncDesc(planCtx.builder.ctx, funcName, []expression.Expression{rexpr}, false)
 	if err != nil {
 		er.err = err
 		return
@@ -777,7 +790,7 @@ func (er *expressionRewriter) buildQuantifierPlan(planCtx *exprRewriterPlanCtx, 
 	innerIsNull := expression.NewFunctionInternal(er.sctx, ast.IsNull, types.NewFieldType(mysql.TypeTiny), rexpr)
 	outerIsNull := expression.NewFunctionInternal(er.sctx, ast.IsNull, types.NewFieldType(mysql.TypeTiny), lexpr)
 
-	funcSum, err := aggregation.NewAggFuncDesc(er.sctx, ast.AggFuncSum, []expression.Expression{innerIsNull}, false)
+	funcSum, err := aggregation.NewAggFuncDesc(planCtx.builder.ctx, ast.AggFuncSum, []expression.Expression{innerIsNull}, false)
 	if err != nil {
 		er.err = err
 		return
@@ -791,7 +804,7 @@ func (er *expressionRewriter) buildQuantifierPlan(planCtx *exprRewriterPlanCtx, 
 	innerHasNull := expression.NewFunctionInternal(er.sctx, ast.NE, types.NewFieldType(mysql.TypeTiny), colSum, expression.NewZero())
 
 	// Build `count(1)` aggregation to check if subquery is empty.
-	funcCount, err := aggregation.NewAggFuncDesc(er.sctx, ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	funcCount, err := aggregation.NewAggFuncDesc(planCtx.builder.ctx, ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
 	if err != nil {
 		er.err = err
 		return
@@ -838,7 +851,7 @@ func (er *expressionRewriter) buildQuantifierPlan(planCtx *exprRewriterPlanCtx, 
 	joinSchema := planCtx.plan.Schema()
 	proj := LogicalProjection{
 		Exprs: expression.Column2Exprs(joinSchema.Clone().Columns[:outerSchemaLen]),
-	}.Init(er.sctx, planCtx.builder.getSelectOffset())
+	}.Init(planCtx.builder.ctx, planCtx.builder.getSelectOffset())
 	proj.names = make([]*types.FieldName, outerSchemaLen, outerSchemaLen+1)
 	copy(proj.names, planCtx.plan.OutputNames())
 	proj.SetSchema(expression.NewSchema(joinSchema.Clone().Columns[:outerSchemaLen]...))
@@ -857,21 +870,22 @@ func (er *expressionRewriter) buildQuantifierPlan(planCtx *exprRewriterPlanCtx, 
 // there must exist a s.id that doesn't equal to t.id.
 func (er *expressionRewriter) handleNEAny(planCtx *exprRewriterPlanCtx, lexpr, rexpr expression.Expression, np LogicalPlan, markNoDecorrelate bool) {
 	intest.AssertNotNil(planCtx)
+	sctx := planCtx.builder.ctx
 	// If there is NULL in s.id column, s.id should be the value that isn't null in condition t.id != s.id.
 	// So use function max to filter NULL.
-	maxFunc, err := aggregation.NewAggFuncDesc(er.sctx, ast.AggFuncMax, []expression.Expression{rexpr}, false)
+	maxFunc, err := aggregation.NewAggFuncDesc(sctx, ast.AggFuncMax, []expression.Expression{rexpr}, false)
 	if err != nil {
 		er.err = err
 		return
 	}
-	countFunc, err := aggregation.NewAggFuncDesc(er.sctx, ast.AggFuncCount, []expression.Expression{rexpr}, true)
+	countFunc, err := aggregation.NewAggFuncDesc(sctx, ast.AggFuncCount, []expression.Expression{rexpr}, true)
 	if err != nil {
 		er.err = err
 		return
 	}
 	plan4Agg := LogicalAggregation{
 		AggFuncs: []*aggregation.AggFuncDesc{maxFunc, countFunc},
-	}.Init(er.sctx, planCtx.builder.getSelectOffset())
+	}.Init(sctx, planCtx.builder.getSelectOffset())
 	if hint := planCtx.builder.TableHints(); hint != nil {
 		plan4Agg.aggHints = hint.Agg
 	}
@@ -897,19 +911,20 @@ func (er *expressionRewriter) handleNEAny(planCtx *exprRewriterPlanCtx, lexpr, r
 // t.id = (select s.id from s having count(distinct s.id) <= 1 and [all checker]).
 func (er *expressionRewriter) handleEQAll(planCtx *exprRewriterPlanCtx, lexpr, rexpr expression.Expression, np LogicalPlan, markNoDecorrelate bool) {
 	intest.AssertNotNil(planCtx)
-	firstRowFunc, err := aggregation.NewAggFuncDesc(er.sctx, ast.AggFuncFirstRow, []expression.Expression{rexpr}, false)
+	sctx := planCtx.builder.ctx
+	firstRowFunc, err := aggregation.NewAggFuncDesc(sctx, ast.AggFuncFirstRow, []expression.Expression{rexpr}, false)
 	if err != nil {
 		er.err = err
 		return
 	}
-	countFunc, err := aggregation.NewAggFuncDesc(er.sctx, ast.AggFuncCount, []expression.Expression{rexpr}, true)
+	countFunc, err := aggregation.NewAggFuncDesc(sctx, ast.AggFuncCount, []expression.Expression{rexpr}, true)
 	if err != nil {
 		er.err = err
 		return
 	}
 	plan4Agg := LogicalAggregation{
 		AggFuncs: []*aggregation.AggFuncDesc{firstRowFunc, countFunc},
-	}.Init(er.sctx, planCtx.builder.getSelectOffset())
+	}.Init(sctx, planCtx.builder.getSelectOffset())
 	if hint := planCtx.builder.TableHints(); hint != nil {
 		plan4Agg.aggHints = hint.Agg
 	}
@@ -962,14 +977,14 @@ func (er *expressionRewriter) handleExistSubquery(ctx context.Context, planCtx *
 
 	noDecorrelate := hintFlags&hint.HintFlagNoDecorrelate > 0
 	if noDecorrelate && len(extractCorColumnsBySchema4LogicalPlan(np, planCtx.plan.Schema())) == 0 {
-		er.sctx.GetSessionVars().StmtCtx.SetHintWarning(ErrInternal.FastGen(
-			"NO_DECORRELATE() is inapplicable because there are no correlated columns."))
+		er.sctx.GetSessionVars().StmtCtx.SetHintWarning(
+			"NO_DECORRELATE() is inapplicable because there are no correlated columns.")
 		noDecorrelate = false
 	}
 	semiJoinRewrite := hintFlags&hint.HintFlagSemiJoinRewrite > 0
 	if semiJoinRewrite && noDecorrelate {
-		er.sctx.GetSessionVars().StmtCtx.SetHintWarning(ErrInternal.FastGen(
-			"NO_DECORRELATE() and SEMI_JOIN_REWRITE() are in conflict. Both will be ineffective."))
+		er.sctx.GetSessionVars().StmtCtx.SetHintWarning(
+			"NO_DECORRELATE() and SEMI_JOIN_REWRITE() are in conflict. Both will be ineffective.")
 		noDecorrelate = false
 		semiJoinRewrite = false
 	}
@@ -984,7 +999,7 @@ func (er *expressionRewriter) handleExistSubquery(ctx context.Context, planCtx *
 		// We don't want nth_plan hint to affect separately executed subqueries here, so disable nth_plan temporarily.
 		nthPlanBackup := er.sctx.GetSessionVars().StmtCtx.StmtHints.ForceNthPlan
 		er.sctx.GetSessionVars().StmtCtx.StmtHints.ForceNthPlan = -1
-		physicalPlan, _, err := DoOptimize(ctx, er.sctx, b.optFlag, np)
+		physicalPlan, _, err := DoOptimize(ctx, planCtx.builder.ctx, b.optFlag, np)
 		er.sctx.GetSessionVars().StmtCtx.StmtHints.ForceNthPlan = nthPlanBackup
 		if err != nil {
 			er.err = err
@@ -1033,7 +1048,7 @@ func (er *expressionRewriter) handleExistSubquery(ctx context.Context, planCtx *
 
 // popExistsSubPlan will remove the useless plan in exist's child.
 // See comments inside the method for more details.
-func (er *expressionRewriter) popExistsSubPlan(planCtx *exprRewriterPlanCtx, p LogicalPlan) LogicalPlan {
+func (*expressionRewriter) popExistsSubPlan(planCtx *exprRewriterPlanCtx, p LogicalPlan) LogicalPlan {
 	intest.AssertNotNil(planCtx)
 out:
 	for {
@@ -1044,7 +1059,7 @@ out:
 			p = p.Children()[0]
 		case *LogicalAggregation:
 			if len(plan.GroupByItems) == 0 {
-				p = LogicalTableDual{RowCount: 1}.Init(er.sctx, planCtx.builder.getSelectOffset())
+				p = LogicalTableDual{RowCount: 1}.Init(planCtx.builder.ctx, planCtx.builder.getSelectOffset())
 				break out
 			}
 			p = p.Children()[0]
@@ -1138,8 +1153,8 @@ func (er *expressionRewriter) handleInSubquery(ctx context.Context, planCtx *exp
 	noDecorrelate := hintFlags&hint.HintFlagNoDecorrelate > 0
 	corCols := extractCorColumnsBySchema4LogicalPlan(np, planCtx.plan.Schema())
 	if len(corCols) == 0 && noDecorrelate {
-		er.sctx.GetSessionVars().StmtCtx.SetHintWarning(ErrInternal.FastGen(
-			"NO_DECORRELATE() is inapplicable because there are no correlated columns."))
+		er.sctx.GetSessionVars().StmtCtx.SetHintWarning(
+			"NO_DECORRELATE() is inapplicable because there are no correlated columns.")
 		noDecorrelate = false
 	}
 
@@ -1159,7 +1174,7 @@ func (er *expressionRewriter) handleInSubquery(ctx context.Context, planCtx *exp
 			return v, true
 		}
 		// Build inner join above the aggregation.
-		join := LogicalJoin{JoinType: InnerJoin}.Init(er.sctx, planCtx.builder.getSelectOffset())
+		join := LogicalJoin{JoinType: InnerJoin}.Init(planCtx.builder.ctx, planCtx.builder.getSelectOffset())
 		join.SetChildren(planCtx.plan, agg)
 		join.SetSchema(expression.MergeSchema(planCtx.plan.Schema(), agg.schema))
 		join.names = make([]*types.FieldName, planCtx.plan.Schema().Len()+agg.Schema().Len())
@@ -1199,8 +1214,8 @@ func (er *expressionRewriter) handleScalarSubquery(ctx context.Context, planCtx 
 
 	noDecorrelate := hintFlags&hint.HintFlagNoDecorrelate > 0
 	if noDecorrelate && len(extractCorColumnsBySchema4LogicalPlan(np, planCtx.plan.Schema())) == 0 {
-		er.sctx.GetSessionVars().StmtCtx.AppendWarning(ErrInternal.FastGen(
-			"NO_DECORRELATE() is inapplicable because there are no correlated columns."))
+		er.sctx.GetSessionVars().StmtCtx.SetHintWarning(
+			"NO_DECORRELATE() is inapplicable because there are no correlated columns.")
 		noDecorrelate = false
 	}
 
@@ -1225,7 +1240,7 @@ func (er *expressionRewriter) handleScalarSubquery(ctx context.Context, planCtx 
 	// We don't want nth_plan hint to affect separately executed subqueries here, so disable nth_plan temporarily.
 	nthPlanBackup := er.sctx.GetSessionVars().StmtCtx.StmtHints.ForceNthPlan
 	er.sctx.GetSessionVars().StmtCtx.StmtHints.ForceNthPlan = -1
-	physicalPlan, _, err := DoOptimize(ctx, er.sctx, planCtx.builder.optFlag, np)
+	physicalPlan, _, err := DoOptimize(ctx, planCtx.builder.ctx, planCtx.builder.optFlag, np)
 	er.sctx.GetSessionVars().StmtCtx.StmtHints.ForceNthPlan = nthPlanBackup
 	if err != nil {
 		er.err = err
@@ -1367,17 +1382,19 @@ func (er *expressionRewriter) Leave(originInNode ast.Node) (retNode ast.Node, ok
 		}
 		er.ctxStackAppend(value, types.EmptyName)
 	case *driver.ParamMarkerExpr:
-		var value *expression.Constant
-		value, er.err = expression.ParamMarkerExpression(er.sctx, v, false)
-		if er.err != nil {
-			return retNode, false
-		}
-		initConstantRepertoire(value)
-		er.adjustUTF8MB4Collation(value.RetType)
-		if er.err != nil {
-			return retNode, false
-		}
-		er.ctxStackAppend(value, types.EmptyName)
+		withPlanCtx(func(planCtx *exprRewriterPlanCtx) {
+			var value *expression.Constant
+			value, er.err = expression.ParamMarkerExpression(planCtx.builder.ctx, v, false)
+			if er.err != nil {
+				return
+			}
+			initConstantRepertoire(value)
+			er.adjustUTF8MB4Collation(value.RetType)
+			if er.err != nil {
+				return
+			}
+			er.ctxStackAppend(value, types.EmptyName)
+		})
 	case *ast.VariableExpr:
 		withPlanCtx(func(planCtx *exprRewriterPlanCtx) {
 			er.rewriteVariable(planCtx, v)
@@ -1517,7 +1534,7 @@ func (er *expressionRewriter) Leave(originInNode ast.Node) (retNode ast.Node, ok
 		// SetCollationExpr sets the collation explicitly, even when the evaluation type of the expression is non-string.
 		if _, ok := arg.(*expression.Column); ok || arg.GetType().GetType() == mysql.TypeJSON {
 			if arg.GetType().GetType() == mysql.TypeEnum || arg.GetType().GetType() == mysql.TypeSet {
-				er.err = ErrNotSupportedYet.GenWithStackByArgs("use collate clause for enum or set")
+				er.err = plannererrors.ErrNotSupportedYet.GenWithStackByArgs("use collate clause for enum or set")
 				break
 			}
 			// Wrap a cast here to avoid changing the original FieldType of the column expression.
@@ -1576,7 +1593,7 @@ func (er *expressionRewriter) newFunction(funcName string, retType *types.FieldT
 
 func (*expressionRewriter) checkTimePrecision(ft *types.FieldType) error {
 	if ft.EvalType() == types.ETDuration && ft.GetDecimal() > types.MaxFsp {
-		return errTooBigPrecision.GenWithStackByArgs(ft.GetDecimal(), "CAST", types.MaxFsp)
+		return plannererrors.ErrTooBigPrecision.GenWithStackByArgs(ft.GetDecimal(), "CAST", types.MaxFsp)
 	}
 	return nil
 }
@@ -1629,10 +1646,10 @@ func (er *expressionRewriter) rewriteVariable(planCtx *exprRewriterPlanCtx, v *a
 	}
 	if sysVar.IsNoop && !variable.EnableNoopVariables.Load() {
 		// The variable does nothing, append a warning to the statement output.
-		sessionVars.StmtCtx.AppendWarning(ErrGettingNoopVariable.FastGenByArgs(sysVar.Name))
+		sessionVars.StmtCtx.AppendWarning(plannererrors.ErrGettingNoopVariable.FastGenByArgs(sysVar.Name))
 	}
 	if sem.IsEnabled() && sem.IsInvisibleSysVar(sysVar.Name) {
-		err := ErrSpecificAccessDenied.GenWithStackByArgs("RESTRICTED_VARIABLES_ADMIN")
+		err := plannererrors.ErrSpecificAccessDenied.GenWithStackByArgs("RESTRICTED_VARIABLES_ADMIN")
 		planCtx.builder.visitInfo = appendDynamicVisitInfo(planCtx.builder.visitInfo, "RESTRICTED_VARIABLES_ADMIN", false, err)
 	}
 	if v.ExplicitScope && !sysVar.HasNoneScope() {
@@ -1775,7 +1792,7 @@ func (er *expressionRewriter) positionToScalarFunc(planCtx *exprRewriterPlanCtx,
 	if er.err == nil && pos > 0 && pos <= er.schema.Len() && !er.schema.Columns[pos-1].IsHidden {
 		er.ctxStackAppend(er.schema.Columns[pos-1], er.names[pos-1])
 	} else {
-		er.err = ErrUnknownColumn.GenWithStackByArgs(str, clauseMsg[planCtx.builder.curClause])
+		er.err = plannererrors.ErrUnknownColumn.GenWithStackByArgs(str, clauseMsg[planCtx.builder.curClause])
 	}
 }
 
@@ -2240,7 +2257,7 @@ func (er *expressionRewriter) funcCallToExpressionWithPlanCtx(planCtx *exprRewri
 		// from the bottom up.
 		intest.AssertNotNil(planCtx)
 		if planCtx.rollExpand == nil {
-			er.err = ErrInvalidGroupFuncUse
+			er.err = plannererrors.ErrInvalidGroupFuncUse
 			er.ctxStackAppend(nil, types.EmptyName)
 		} else {
 			// whether there is some duplicate grouping sets, gpos is only be used in shuffle keys and group keys
@@ -2253,7 +2270,7 @@ func (er *expressionRewriter) funcCallToExpressionWithPlanCtx(planCtx *exprRewri
 			//  {a, b, 0, 1}, {a, null, 1, 2}, {a, null, 1, 3}, {null, null, 2, 4}
 			// grouping function still only need to care about gid is enough, gpos what group and shuffle keys cared.
 			if len(args) > 64 {
-				er.err = ErrInvalidNumberOfArgs.GenWithStackByArgs("GROUPING", 64)
+				er.err = plannererrors.ErrInvalidNumberOfArgs.GenWithStackByArgs("GROUPING", 64)
 				er.ctxStackAppend(nil, types.EmptyName)
 				return
 			}
@@ -2292,7 +2309,7 @@ func (er *expressionRewriter) funcCallToExpression(v *ast.FuncCallExpr) {
 
 	var function expression.Expression
 	er.ctxStackPop(len(v.Args))
-	if _, ok := expression.DeferredFunctions[v.FnName.L]; er.useCache() && ok {
+	if ok := expression.IsDeferredFunctions(er.sctx, v.FnName.L); er.useCache() && ok {
 		// When the expression is unix_timestamp and the number of argument is not zero,
 		// we deal with it as normal expression.
 		if v.FnName.L == ast.UnixTimestamp && len(v.Args) != 0 {
@@ -2333,13 +2350,13 @@ func (er *expressionRewriter) clause() clauseCode {
 func (er *expressionRewriter) toColumn(v *ast.ColumnName) {
 	idx, err := expression.FindFieldName(er.names, v)
 	if err != nil {
-		er.err = ErrAmbiguous.GenWithStackByArgs(v.Name, clauseMsg[fieldList])
+		er.err = plannererrors.ErrAmbiguous.GenWithStackByArgs(v.Name, clauseMsg[fieldList])
 		return
 	}
 	if idx >= 0 {
 		column := er.schema.Columns[idx]
 		if column.IsHidden {
-			er.err = ErrUnknownColumn.GenWithStackByArgs(v.Name, clauseMsg[er.clause()])
+			er.err = plannererrors.ErrUnknownColumn.GenWithStackByArgs(v.Name, clauseMsg[er.clause()])
 			return
 		}
 		er.ctxStackAppend(column, er.names[idx])
@@ -2348,7 +2365,7 @@ func (er *expressionRewriter) toColumn(v *ast.ColumnName) {
 
 	planCtx := er.planCtx
 	if planCtx == nil {
-		er.err = ErrUnknownColumn.GenWithStackByArgs(v.Name, clauseMsg[er.clause()])
+		er.err = plannererrors.ErrUnknownColumn.GenWithStackByArgs(v.String(), clauseMsg[er.clause()])
 		return
 	}
 
@@ -2369,18 +2386,18 @@ func (er *expressionRewriter) toColumn(v *ast.ColumnName) {
 			return
 		}
 		if err != nil {
-			er.err = ErrAmbiguous.GenWithStackByArgs(v.Name, clauseMsg[fieldList])
+			er.err = plannererrors.ErrAmbiguous.GenWithStackByArgs(v.Name, clauseMsg[fieldList])
 			return
 		}
 	}
 	if _, ok := planCtx.plan.(*LogicalUnionAll); ok && v.Table.O != "" {
-		er.err = ErrTablenameNotAllowedHere.GenWithStackByArgs(v.Table.O, "SELECT", clauseMsg[planCtx.builder.curClause])
+		er.err = plannererrors.ErrTablenameNotAllowedHere.GenWithStackByArgs(v.Table.O, "SELECT", clauseMsg[planCtx.builder.curClause])
 		return
 	}
 	if planCtx.builder.curClause == globalOrderByClause {
 		planCtx.builder.curClause = orderByClause
 	}
-	er.err = ErrUnknownColumn.GenWithStackByArgs(v.String(), clauseMsg[planCtx.builder.curClause])
+	er.err = plannererrors.ErrUnknownColumn.GenWithStackByArgs(v.String(), clauseMsg[planCtx.builder.curClause])
 }
 
 func findFieldNameFromNaturalUsingJoin(p LogicalPlan, v *ast.ColumnName) (col *expression.Column, name *types.FieldName, err error) {
@@ -2408,7 +2425,7 @@ func (er *expressionRewriter) evalDefaultExprForTable(v *ast.DefaultExpr, tbl *m
 		return
 	}
 	if idx < 0 {
-		er.err = ErrUnknownColumn.GenWithStackByArgs(v.Name.OrigColName(), "field list")
+		er.err = plannererrors.ErrUnknownColumn.GenWithStackByArgs(v.Name.OrigColName(), "field list")
 		return
 	}
 	name := er.names[idx]
@@ -2443,7 +2460,7 @@ func (er *expressionRewriter) evalDefaultExprWithPlanCtx(planCtx *exprRewriterPl
 			return
 		}
 		if idx < 0 {
-			er.err = ErrUnknownColumn.GenWithStackByArgs(v.Name.OrigColName(), "field list")
+			er.err = plannererrors.ErrUnknownColumn.GenWithStackByArgs(v.Name.OrigColName(), "field list")
 			return
 		}
 		name = er.names[idx]
@@ -2477,7 +2494,7 @@ func (er *expressionRewriter) evalFieldDefaultValue(field *types.FieldName, tblI
 	}
 	col := tblInfo.FindPublicColumnByName(colName)
 	if col == nil {
-		er.err = ErrUnknownColumn.GenWithStackByArgs(colName, "field_list")
+		er.err = plannererrors.ErrUnknownColumn.GenWithStackByArgs(colName, "field_list")
 		return
 	}
 	isCurrentTimestamp := hasCurrentDatetimeDefault(col)
