@@ -795,14 +795,11 @@ func (b *executorBuilder) buildLimit(v *plannercore.PhysicalLimit) exec.Executor
 		end:          v.Offset + v.Count,
 	}
 
+	childUsedSchemaLen := v.Children()[0].Schema().Len()
 	childUsedSchema := markChildrenUsedCols(v.Schema().Columns, v.Children()[0].Schema())[0]
 	e.columnIdxsUsedByChild = make([]int, 0, len(childUsedSchema))
-	for i, used := range childUsedSchema {
-		if used {
-			e.columnIdxsUsedByChild = append(e.columnIdxsUsedByChild, i)
-		}
-	}
-	if len(e.columnIdxsUsedByChild) == len(childUsedSchema) {
+	e.columnIdxsUsedByChild = append(e.columnIdxsUsedByChild, childUsedSchema...)
+	if len(e.columnIdxsUsedByChild) == childUsedSchemaLen {
 		e.columnIdxsUsedByChild = nil // indicates that all columns are used. LimitExec will improve performance for this condition.
 	}
 	return e
@@ -2831,21 +2828,39 @@ func (b *executorBuilder) buildAnalyze(v *plannercore.Analyze) exec.Executor {
 
 // markChildrenUsedCols compares each child with the output schema, and mark
 // each column of the child is used by output or not.
-func markChildrenUsedCols(outputCols []*expression.Column, childSchemas ...*expression.Schema) (childrenUsed [][]bool) {
-	childrenUsed = make([][]bool, 0, len(childSchemas))
-	markedOffsets := make(map[int]struct{})
-	for _, col := range outputCols {
-		markedOffsets[col.Index] = struct{}{}
+func markChildrenUsedCols(outputCols []*expression.Column, childSchemas ...*expression.Schema) (childrenUsed [][]int) {
+	childrenUsed = make([][]int, 0, len(childSchemas))
+	markedOffsets := make(map[int]int)
+	// keep the original maybe reversed order.
+	for originalIdx, col := range outputCols {
+		markedOffsets[col.Index] = originalIdx
 	}
 	prefixLen := 0
+	type intPair struct {
+		first  int
+		second int
+	}
+	// for example here.
+	// left child schema: [col11]
+	// right child schema: [col21, col22]
+	// output schema is [col11, col22, col21], if not records the original derived order after physical resolve index.
+	// the lused will be [0], the rused will be [0,1], while the actual order is dismissed, [1,0] is correct for rused.
 	for _, childSchema := range childSchemas {
-		used := make([]bool, len(childSchema.Columns))
+		usedIdxPair := make([]intPair, 0, len(childSchema.Columns))
 		for i := range childSchema.Columns {
-			if _, ok := markedOffsets[prefixLen+i]; ok {
-				used[i] = true
+			if originalIdx, ok := markedOffsets[prefixLen+i]; ok {
+				usedIdxPair = append(usedIdxPair, intPair{first: originalIdx, second: i})
 			}
 		}
-		childrenUsed = append(childrenUsed, used)
+		// sort the used idxes according their original indexes derived after resolveIndex.
+		slices.SortFunc(usedIdxPair, func(a, b intPair) int {
+			return cmp.Compare(a.first, b.first)
+		})
+		usedIdx := make([]int, 0, len(childSchema.Columns))
+		for _, one := range usedIdxPair {
+			usedIdx = append(usedIdx, one.second)
+		}
+		childrenUsed = append(childrenUsed, usedIdx)
 		prefixLen += childSchema.Len()
 	}
 	return
@@ -4529,7 +4544,7 @@ func buildRangesForIndexJoin(ctx sessionctx.Context, lookUpContents []*indexJoin
 			}
 			continue
 		}
-		nextColRanges, err := cwc.BuildRangesByRow(ctx, content.row)
+		nextColRanges, err := cwc.BuildRangesByRow(ctx.GetPlanCtx(), content.row)
 		if err != nil {
 			return nil, err
 		}
@@ -4549,7 +4564,7 @@ func buildRangesForIndexJoin(ctx sessionctx.Context, lookUpContents []*indexJoin
 		return retRanges, nil
 	}
 
-	return ranger.UnionRanges(ctx, tmpDatumRanges, true)
+	return ranger.UnionRanges(ctx.GetPlanCtx(), tmpDatumRanges, true)
 }
 
 // buildKvRangesForIndexJoin builds kv ranges for index join when the inner plan is index scan plan.
@@ -4584,7 +4599,7 @@ func buildKvRangesForIndexJoin(ctx sessionctx.Context, tableID, indexID int64, l
 			kvRanges = tmpKvRanges.AppendSelfTo(kvRanges)
 			continue
 		}
-		nextColRanges, err := cwc.BuildRangesByRow(ctx, content.row)
+		nextColRanges, err := cwc.BuildRangesByRow(ctx.GetPlanCtx(), content.row)
 		if err != nil {
 			return nil, err
 		}
@@ -4615,7 +4630,7 @@ func buildKvRangesForIndexJoin(ctx sessionctx.Context, tableID, indexID int64, l
 		return kvRanges, nil
 	}
 
-	tmpDatumRanges, err = ranger.UnionRanges(ctx, tmpDatumRanges, true)
+	tmpDatumRanges, err = ranger.UnionRanges(ctx.GetPlanCtx(), tmpDatumRanges, true)
 	if err != nil {
 		return nil, err
 	}
@@ -4785,7 +4800,7 @@ func (b *executorBuilder) buildShuffle(v *plannercore.PhysicalShuffle) *ShuffleE
 	for _, dataSource := range v.DataSources {
 		stub := plannercore.PhysicalShuffleReceiverStub{
 			DataSource: dataSource,
-		}.Init(b.ctx, dataSource.StatsInfo(), dataSource.QueryBlockOffset(), nil)
+		}.Init(b.ctx.GetPlanCtx(), dataSource.StatsInfo(), dataSource.QueryBlockOffset(), nil)
 		stub.SetSchema(dataSource.Schema())
 		stubs = append(stubs, stub)
 	}
@@ -5079,7 +5094,7 @@ func (builder *dataReaderBuilder) partitionPruning(tbl table.PartitionedTable, p
 }
 
 func partitionPruning(ctx sessionctx.Context, tbl table.PartitionedTable, planPartInfo *plannercore.PhysPlanPartInfo) ([]table.PhysicalTable, error) {
-	idxArr, err := plannercore.PartitionPruning(ctx, tbl, planPartInfo.PruningConds, planPartInfo.PartitionNames, planPartInfo.Columns, planPartInfo.ColumnNames)
+	idxArr, err := plannercore.PartitionPruning(ctx.GetPlanCtx(), tbl, planPartInfo.PruningConds, planPartInfo.PartitionNames, planPartInfo.Columns, planPartInfo.ColumnNames)
 	if err != nil {
 		return nil, err
 	}
@@ -5107,7 +5122,7 @@ func getPartitionIDsAfterPruning(ctx sessionctx.Context, tbl table.PartitionedTa
 	if physPlanPartInfo == nil {
 		return nil, errors.New("physPlanPartInfo in getPartitionIDsAfterPruning must not be nil")
 	}
-	idxArr, err := plannercore.PartitionPruning(ctx, tbl, physPlanPartInfo.PruningConds, physPlanPartInfo.PartitionNames, physPlanPartInfo.Columns, physPlanPartInfo.ColumnNames)
+	idxArr, err := plannercore.PartitionPruning(ctx.GetPlanCtx(), tbl, physPlanPartInfo.PruningConds, physPlanPartInfo.PartitionNames, physPlanPartInfo.Columns, physPlanPartInfo.ColumnNames)
 	if err != nil {
 		return nil, err
 	}
