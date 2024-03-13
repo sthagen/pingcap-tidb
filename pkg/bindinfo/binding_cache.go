@@ -20,7 +20,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pingcap/tidb/pkg/bindinfo/internal/logutil"
 	"github.com/pingcap/tidb/pkg/bindinfo/norm"
+	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/sessionctx"
@@ -28,7 +30,6 @@ import (
 	"github.com/pingcap/tidb/pkg/util/hack"
 	"github.com/pingcap/tidb/pkg/util/intest"
 	"github.com/pingcap/tidb/pkg/util/kvcache"
-	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/mathutil"
 	"github.com/pingcap/tidb/pkg/util/memory"
 	"github.com/pingcap/tidb/pkg/util/stringutil"
@@ -84,10 +85,20 @@ func newFuzzyBindingCache(loadBindingFromStorageFunc func(sessionctx.Context, st
 	}
 }
 
+func (fbc *fuzzyBindingCache) shouldMetric() bool {
+	return fbc.loadBindingFromStorageFunc != nil // only metric for GlobalBindingCache, whose loadBindingFromStorageFunc is not nil.
+}
+
 func (fbc *fuzzyBindingCache) FuzzyMatchingBinding(sctx sessionctx.Context, fuzzyDigest string, tableNames []*ast.TableName) (matchedBinding Binding, isMatched bool) {
 	matchedBinding, isMatched, missingSQLDigest := fbc.getFromMemory(sctx, fuzzyDigest, tableNames)
 	if len(missingSQLDigest) == 0 {
+		if fbc.shouldMetric() && isMatched {
+			metrics.BindingCacheHitCounter.Inc()
+		}
 		return
+	}
+	if fbc.shouldMetric() {
+		metrics.BindingCacheMissCounter.Inc()
 	}
 	if fbc.loadBindingFromStorageFunc == nil {
 		return
@@ -146,7 +157,7 @@ func (fbc *fuzzyBindingCache) loadFromStore(sctx sessionctx.Context, missingSQLD
 		start := time.Now()
 		bindings, err := fbc.loadBindingFromStorageFunc(sctx, sqlDigest)
 		if err != nil {
-			logutil.BgLogger().Warn("failed to load binding from storage",
+			logutil.BindLogger().Warn("failed to load binding from storage",
 				zap.String("sqlDigest", sqlDigest),
 				zap.Error(err),
 				zap.Duration("duration", time.Since(start)),
@@ -162,7 +173,7 @@ func (fbc *fuzzyBindingCache) loadFromStore(sctx sessionctx.Context, missingSQLD
 				// When the memory capacity of bing_cache is not enough,
 				// there will be some memory-related errors in multiple places.
 				// Only needs to be handled once.
-				logutil.BgLogger().Warn("BindHandle.Update", zap.String("category", "sql-bind"), zap.Error(err))
+				logutil.BindLogger().Warn("BindHandle.Update", zap.Error(err))
 			}
 		}
 	}
