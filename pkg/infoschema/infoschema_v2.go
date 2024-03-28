@@ -278,6 +278,10 @@ func (is *infoschemaV2) base() *infoSchema {
 }
 
 func (is *infoschemaV2) TableByID(id int64) (val table.Table, ok bool) {
+	if !tableIDIsValid(id) {
+		return
+	}
+
 	// Get from the cache.
 	key := tableCacheKey{id, is.infoSchema.schemaMetaVersion}
 	tbl, found := is.tableCache.Get(key)
@@ -679,6 +683,33 @@ func updateInfoSchemaBundles(b *Builder) {
 	} else {
 		b.updateInfoSchemaBundles(b.infoSchema)
 	}
+}
+
+func oldSchemaInfo(b *Builder, diff *model.SchemaDiff) (*model.DBInfo, bool) {
+	if b.enableV2 {
+		return b.infoschemaV2.SchemaByID(diff.OldSchemaID)
+	}
+
+	oldRoDBInfo, ok := b.infoSchema.SchemaByID(diff.OldSchemaID)
+	if ok {
+		oldRoDBInfo = b.getSchemaAndCopyIfNecessary(oldRoDBInfo.Name.L)
+	}
+	return oldRoDBInfo, ok
+}
+
+// allocByID returns the Allocators of a table.
+func allocByID(b *Builder, id int64) (autoid.Allocators, bool) {
+	var is InfoSchema
+	if b.enableV2 {
+		is = &b.infoschemaV2
+	} else {
+		is = b.infoSchema
+	}
+	tbl, ok := is.TableByID(id)
+	if !ok {
+		return autoid.Allocators{}, false
+	}
+	return tbl.Allocators(nil), true
 }
 
 // TODO: more UT to check the correctness.

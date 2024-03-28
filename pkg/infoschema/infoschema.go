@@ -104,7 +104,17 @@ func MockInfoSchema(tbList []*model.TableInfo) InfoSchema {
 		tables: make(map[string]table.Table),
 	}
 	result.schemaMap["test"] = tableNames
+	var tableIDs map[int64]struct{}
 	for _, tb := range tbList {
+		intest.AssertFunc(func() bool {
+			if tableIDs == nil {
+				tableIDs = make(map[int64]struct{})
+			}
+			_, ok := tableIDs[tb.ID]
+			intest.Assert(!ok)
+			tableIDs[tb.ID] = struct{}{}
+			return true
+		})
 		tb.DBID = dbInfo.ID
 		tbl := table.MockTableFromMeta(tb)
 		tableNames.tables[tb.Name.L] = tbl
@@ -238,6 +248,10 @@ func SchemaByTable(is InfoSchema, tableInfo *model.TableInfo) (val *model.DBInfo
 }
 
 func (is *infoSchema) TableByID(id int64) (val table.Table, ok bool) {
+	if !tableIDIsValid(id) {
+		return nil, false
+	}
+
 	slice := is.sortedTablesBuckets[tableBucketIdx(id)]
 	idx := slice.searchTable(id)
 	if idx == -1 {
@@ -263,15 +277,6 @@ func (is *infoSchema) FindTableInfoByPartitionID(
 // SchemaTableInfos implements InfoSchema.FindTableInfoByPartitionID
 func (is *infoSchema) SchemaTableInfos(schema model.CIStr) []*model.TableInfo {
 	return getTableInfoList(is.SchemaTables(schema))
-}
-
-// allocByID returns the Allocators of a table.
-func allocByID(is InfoSchema, id int64) (autoid.Allocators, bool) {
-	tbl, ok := is.TableByID(id)
-	if !ok {
-		return autoid.Allocators{}, false
-	}
-	return tbl.Allocators(nil), true
 }
 
 // AllSchemaNames returns all the schemas' names.
@@ -713,6 +718,10 @@ func (ts *SessionExtendedInfoSchema) FindTableInfoByPartitionID(
 
 // TableByID implements InfoSchema.TableByID
 func (ts *SessionExtendedInfoSchema) TableByID(id int64) (table.Table, bool) {
+	if !tableIDIsValid(id) {
+		return nil, false
+	}
+
 	if ts.LocalTemporaryTables != nil {
 		if tbl, ok := ts.LocalTemporaryTables.TableByID(id); ok {
 			return tbl, true
