@@ -3574,8 +3574,7 @@ func getLimitPhysicalPlans(p *LogicalLimit, prop *property.PhysicalProperty) ([]
 	return ret, true, nil
 }
 
-// ExhaustPhysicalPlans implements LogicalPlan interface.
-func (p *LogicalLock) ExhaustPhysicalPlans(prop *property.PhysicalProperty) ([]base.PhysicalPlan, bool, error) {
+func getLockPhysicalPlans(p *LogicalLock, prop *property.PhysicalProperty) ([]base.PhysicalPlan, bool, error) {
 	if prop.IsFlashProp() {
 		p.SCtx().GetSessionVars().RaiseWarningWhenMPPEnforced(
 			"MPP mode may be blocked because operator `Lock` is not supported now.")
@@ -3647,12 +3646,12 @@ func (p *LogicalPartitionUnionAll) ExhaustPhysicalPlans(prop *property.PhysicalP
 	return uas, flagHint, nil
 }
 
-func (ls *LogicalSort) getPhysicalSort(prop *property.PhysicalProperty) *PhysicalSort {
+func getPhysicalSort(ls *LogicalSort, prop *property.PhysicalProperty) *PhysicalSort {
 	ps := PhysicalSort{ByItems: ls.ByItems}.Init(ls.SCtx(), ls.StatsInfo().ScaleByExpectCnt(prop.ExpectedCnt), ls.QueryBlockOffset(), &property.PhysicalProperty{TaskTp: prop.TaskTp, ExpectedCnt: math.MaxFloat64, RejectSort: true, CTEProducerStatus: prop.CTEProducerStatus})
 	return ps
 }
 
-func (ls *LogicalSort) getNominalSort(reqProp *property.PhysicalProperty) *NominalSort {
+func getNominalSort(ls *LogicalSort, reqProp *property.PhysicalProperty) *NominalSort {
 	prop, canPass, onlyColumn := GetPropByOrderByItemsContainScalarFunc(ls.ByItems)
 	if !canPass {
 		return nil
@@ -3664,28 +3663,12 @@ func (ls *LogicalSort) getNominalSort(reqProp *property.PhysicalProperty) *Nomin
 	return ps
 }
 
-// ExhaustPhysicalPlans implements LogicalPlan interface.
-func (ls *LogicalSort) ExhaustPhysicalPlans(prop *property.PhysicalProperty) ([]base.PhysicalPlan, bool, error) {
-	if prop.TaskTp == property.RootTaskType {
-		if MatchItems(prop, ls.ByItems) {
-			ret := make([]base.PhysicalPlan, 0, 2)
-			ret = append(ret, ls.getPhysicalSort(prop))
-			ns := ls.getNominalSort(prop)
-			if ns != nil {
-				ret = append(ret, ns)
-			}
-			return ret, true, nil
-		}
-	} else if prop.TaskTp == property.MppTaskType && prop.RejectSort {
-		if canPushToCopImpl(&ls.BaseLogicalPlan, kv.TiFlash, true) {
-			newProp := prop.CloneEssentialFields()
-			newProp.RejectSort = true
-			ps := NominalSort{OnlyColumn: true, ByItems: ls.ByItems}.Init(
-				ls.SCtx(), ls.StatsInfo().ScaleByExpectCnt(prop.ExpectedCnt), ls.QueryBlockOffset(), newProp)
-			return []base.PhysicalPlan{ps}, true, nil
-		}
-	}
-	return nil, true, nil
+func getNominalSortSimple(ls *LogicalSort, reqProp *property.PhysicalProperty) *NominalSort {
+	newProp := reqProp.CloneEssentialFields()
+	newProp.RejectSort = true
+	ps := NominalSort{OnlyColumn: true, ByItems: ls.ByItems}.Init(
+		ls.SCtx(), ls.StatsInfo().ScaleByExpectCnt(reqProp.ExpectedCnt), ls.QueryBlockOffset(), newProp)
+	return ps
 }
 
 // ExhaustPhysicalPlans implements LogicalPlan interface.
