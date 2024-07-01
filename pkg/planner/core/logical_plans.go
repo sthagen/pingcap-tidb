@@ -1131,17 +1131,6 @@ type LogicalMaxOneRow struct {
 	logicalop.BaseLogicalPlan
 }
 
-// LogicalTableDual represents a dual table plan.
-// Note that sometimes we don't set schema for LogicalTableDual (most notably in buildTableDual()), which means
-// outputting 0/1 row with zero column. This semantic may be different from your expectation sometimes but should not
-// cause any actual problems now.
-type LogicalTableDual struct {
-	logicalop.LogicalSchemaProducer
-
-	// RowCount could only be 0 or 1.
-	RowCount int
-}
-
 // LogicalMemTable represents a memory table or virtual table
 // Some memory tables wants to take the ownership of some predications
 // e.g
@@ -1642,11 +1631,6 @@ func (p *LogicalIndexScan) getPKIsHandleCol(schema *expression.Schema) *expressi
 	// Because we may re-prune p.Columns and p.schema during the transformation.
 	// That will make p.Columns different from p.Source.Columns.
 	return getPKIsHandleColFromSchema(p.Columns, schema, p.Source.TableInfo.PKIsHandle)
-}
-
-// LogicalPartitionUnionAll represents the LogicalUnionAll plan is for partition table.
-type LogicalPartitionUnionAll struct {
-	LogicalUnionAll
 }
 
 // WindowFrame represents a window function frame.
