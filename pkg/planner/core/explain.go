@@ -906,16 +906,6 @@ func (p *LogicalJoin) ExplainInfo() string {
 }
 
 // ExplainInfo implements Plan interface.
-func (p *LogicalProjection) ExplainInfo() string {
-	return expression.ExplainExpressionList(p.SCtx().GetExprCtx().GetEvalCtx(), p.Exprs, p.Schema())
-}
-
-// ExplainInfo implements Plan interface.
-func (p *LogicalSelection) ExplainInfo() string {
-	return string(expression.SortedExplainExpressionList(p.SCtx().GetExprCtx().GetEvalCtx(), p.Conditions))
-}
-
-// ExplainInfo implements Plan interface.
 func (p *LogicalApply) ExplainInfo() string {
 	return p.LogicalJoin.ExplainInfo()
 }
@@ -1014,19 +1004,6 @@ func explainNormalizedByItems(buffer *bytes.Buffer, byItems []*util.ByItems) *by
 		}
 	}
 	return buffer
-}
-
-// ExplainInfo implements Plan interface.
-func (p *LogicalTableScan) ExplainInfo() string {
-	ectx := p.SCtx().GetExprCtx().GetEvalCtx()
-	buffer := bytes.NewBufferString(p.Source.ExplainInfo())
-	if p.Source.HandleCols != nil {
-		fmt.Fprintf(buffer, ", pk col:%s", p.Source.HandleCols.StringWithCtx(ectx))
-	}
-	if len(p.AccessConds) > 0 {
-		fmt.Fprintf(buffer, ", cond:%v", p.AccessConds)
-	}
-	return buffer.String()
 }
 
 // ExplainInfo implements Plan interface.
