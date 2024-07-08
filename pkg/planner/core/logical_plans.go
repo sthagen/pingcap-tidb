@@ -180,15 +180,6 @@ type LogicalMemTable struct {
 	QueryTimeRange util.QueryTimeRange
 }
 
-// LogicalUnionScan is used in non read-only txn or for scanning a local temporary table whose snapshot data is located in memory.
-type LogicalUnionScan struct {
-	logicalop.BaseLogicalPlan
-
-	conditions []expression.Expression
-
-	handleCols util.HandleCols
-}
-
 // WindowFrame represents a window function frame.
 type WindowFrame struct {
 	Type  ast.FrameType
@@ -326,14 +317,6 @@ func (s *ShowContents) MemoryUsage() (sum int64) {
 	sum = emptyShowContentsSize + int64(len(s.DBName)) + s.Partition.MemoryUsage() + s.IndexName.MemoryUsage() +
 		int64(cap(s.Roles))*size.SizeOfPointer
 	return
-}
-
-// LogicalShow represents a show plan.
-type LogicalShow struct {
-	logicalop.LogicalSchemaProducer
-	ShowContents
-
-	Extractor base.ShowPredicateExtractor
 }
 
 // LogicalShowDDLJobs is for showing DDL job list.
