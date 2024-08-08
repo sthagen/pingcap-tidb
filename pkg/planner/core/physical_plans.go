@@ -79,6 +79,12 @@ var (
 	_ base.PhysicalPlan = &PhysicalShuffleReceiverStub{}
 	_ base.PhysicalPlan = &BatchPointGetPlan{}
 	_ base.PhysicalPlan = &PhysicalTableSample{}
+
+	_ PhysicalJoin = &PhysicalHashJoin{}
+	_ PhysicalJoin = &PhysicalMergeJoin{}
+	_ PhysicalJoin = &PhysicalIndexJoin{}
+	_ PhysicalJoin = &PhysicalIndexHashJoin{}
+	_ PhysicalJoin = &PhysicalIndexMergeJoin{}
 )
 
 type tableScanAndPartitionInfo struct {
@@ -1214,6 +1220,11 @@ type PhysicalApply struct {
 	OuterSchema []*expression.CorrelatedColumn
 }
 
+// PhysicalJoinImplement has an extra bool return value compared with PhysicalJoin interface.
+// This will override basePhysicalJoin.PhysicalJoinImplement() and make PhysicalApply not an implementation of
+// base.PhysicalJoin interface.
+func (*PhysicalApply) PhysicalJoinImplement() bool { return false }
+
 // Clone implements op.PhysicalPlan interface.
 func (la *PhysicalApply) Clone(newCtx base.PlanContext) (base.PhysicalPlan, error) {
 	cloned := new(PhysicalApply)
@@ -1257,6 +1268,15 @@ func (la *PhysicalApply) MemoryUsage() (sum int64) {
 	return
 }
 
+// PhysicalJoin provides some common methods for join operators.
+// Note that PhysicalApply is deliberately excluded from this interface.
+type PhysicalJoin interface {
+	base.PhysicalPlan
+	PhysicalJoinImplement()
+	getInnerChildIdx() int
+	GetJoinType() JoinType
+}
+
 type basePhysicalJoin struct {
 	physicalSchemaProducer
 
@@ -1281,6 +1301,13 @@ type basePhysicalJoin struct {
 	LeftNAJoinKeys  []*expression.Column
 	RightNAJoinKeys []*expression.Column
 }
+
+func (p *basePhysicalJoin) GetJoinType() JoinType {
+	return p.JoinType
+}
+
+// PhysicalJoinImplement implements base.PhysicalJoin interface.
+func (*basePhysicalJoin) PhysicalJoinImplement() {}
 
 func (p *basePhysicalJoin) getInnerChildIdx() int {
 	return p.InnerChildIdx
@@ -1840,7 +1867,7 @@ func (p *PhysicalMergeJoin) Clone(newCtx base.PlanContext) (base.PhysicalPlan, e
 type PhysicalLock struct {
 	basePhysicalPlan
 
-	Lock *ast.SelectLockInfo
+	Lock *ast.SelectLockInfo `plan-cache-clone:"shallow"`
 
 	TblID2Handle       map[int64][]util.HandleCols
 	TblID2PhysTblIDCol map[int64]*expression.Column
@@ -2073,6 +2100,7 @@ func (p *basePhysicalAgg) MemoryUsage() (sum int64) {
 // PhysicalHashAgg is hash operator of aggregate.
 type PhysicalHashAgg struct {
 	basePhysicalAgg
+	tiflashPreAggMode string
 }
 
 func (p *PhysicalHashAgg) getPointer() *basePhysicalAgg {
@@ -2088,6 +2116,7 @@ func (p *PhysicalHashAgg) Clone(newCtx base.PlanContext) (base.PhysicalPlan, err
 		return nil, err
 	}
 	cloned.basePhysicalAgg = *base
+	cloned.tiflashPreAggMode = p.tiflashPreAggMode
 	return cloned, nil
 }
 
