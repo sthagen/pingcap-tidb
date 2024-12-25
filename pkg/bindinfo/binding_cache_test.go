@@ -33,7 +33,7 @@ func bindingNoDBDigest(t *testing.T, b *Binding) string {
 }
 
 func TestCrossDBBindingCache(t *testing.T) {
-	fbc := newBindCache(nil).(*bindingCache)
+	fbc := newBindCache().(*bindingCache)
 	b1 := &Binding{BindSQL: "SELECT * FROM db1.t1", SQLDigest: "b1"}
 	fDigest1 := bindingNoDBDigest(t, b1)
 	b2 := &Binding{BindSQL: "SELECT * FROM db2.t1", SQLDigest: "b2"}
@@ -41,9 +41,9 @@ func TestCrossDBBindingCache(t *testing.T) {
 	fDigest3 := bindingNoDBDigest(t, b3)
 
 	// add 3 bindings and b1 and b2 have the same noDBDigest
-	require.NoError(t, fbc.SetBinding(b1.SQLDigest, []*Binding{b1}))
-	require.NoError(t, fbc.SetBinding(b2.SQLDigest, []*Binding{b2}))
-	require.NoError(t, fbc.SetBinding(b3.SQLDigest, []*Binding{b3}))
+	require.NoError(t, fbc.SetBinding(b1.SQLDigest, b1))
+	require.NoError(t, fbc.SetBinding(b2.SQLDigest, b2))
+	require.NoError(t, fbc.SetBinding(b3.SQLDigest, b3))
 	require.Equal(t, len(fbc.digestBiMap.(*digestBiMapImpl).noDBDigest2SQLDigest), 2) // b1 and b2 have the same noDBDigest
 	require.Equal(t, len(fbc.digestBiMap.NoDBDigest2SQLDigest(fDigest1)), 2)
 	require.Equal(t, len(fbc.digestBiMap.NoDBDigest2SQLDigest(fDigest3)), 1)
@@ -70,24 +70,24 @@ func TestCrossDBBindingCache(t *testing.T) {
 }
 
 func TestBindCache(t *testing.T) {
-	bindings := []*Binding{{BindSQL: "SELECT * FROM t1"}}
-	kvSize := int(bindings[0].size())
+	binding := &Binding{BindSQL: "SELECT * FROM t1"}
+	kvSize := int(binding.size())
 	defer func(v int64) {
 		variable.MemQuotaBindingCache.Store(v)
 	}(variable.MemQuotaBindingCache.Load())
 	variable.MemQuotaBindingCache.Store(int64(kvSize*3) - 1)
-	bindCache := newBindCache(nil)
+	bindCache := newBindCache()
 	defer bindCache.Close()
 
-	err := bindCache.SetBinding("digest1", bindings)
+	err := bindCache.SetBinding("digest1", binding)
 	require.Nil(t, err)
 	require.NotNil(t, bindCache.GetBinding("digest1"))
 
-	err = bindCache.SetBinding("digest2", bindings)
+	err = bindCache.SetBinding("digest2", binding)
 	require.Nil(t, err)
 	require.NotNil(t, bindCache.GetBinding("digest2"))
 
-	err = bindCache.SetBinding("digest3", bindings)
+	err = bindCache.SetBinding("digest3", binding)
 	require.Nil(t, err)
 	require.NotNil(t, bindCache.GetBinding("digest3"))
 
