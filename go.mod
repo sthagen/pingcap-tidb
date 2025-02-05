@@ -109,7 +109,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/tdakkota/asciicheck v0.3.0
 	github.com/tiancaiamao/appdash v0.0.0-20181126055449-889f96f722a2
-	github.com/tikv/client-go/v2 v2.0.8-0.20250117034919-61e09c6539bd
+	github.com/tikv/client-go/v2 v2.0.8-0.20250124091023-d0d0c9712f43
 	github.com/tikv/pd/client v0.0.0-20250107032658-5c4ab57d68de
 	github.com/timakin/bodyclose v0.0.0-20241017074812-ed6a65f985e3
 	github.com/twmb/murmur3 v1.1.6
@@ -138,7 +138,7 @@ require (
 	golang.org/x/sys v0.29.0
 	golang.org/x/term v0.28.0
 	golang.org/x/text v0.21.0
-	golang.org/x/time v0.7.0
+	golang.org/x/time v0.9.0
 	golang.org/x/tools v0.29.0
 	google.golang.org/api v0.169.0
 	google.golang.org/grpc v1.63.2
