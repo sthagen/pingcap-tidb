@@ -2757,7 +2757,6 @@ func (s *session) GetRangerCtx() *rangerctx.RangerContext {
 			TypeCtx: s.GetSessionVars().StmtCtx.TypeCtx(),
 			ErrCtx:  s.GetSessionVars().StmtCtx.ErrCtx(),
 
-			InPreparedPlanBuilding:   s.GetSessionVars().StmtCtx.InPreparedPlanBuilding,
 			RegardNULLAsPoint:        s.GetSessionVars().RegardNULLAsPoint,
 			OptPrefixIndexSingleScan: s.GetSessionVars().OptPrefixIndexSingleScan,
 			OptimizerFixControl:      s.GetSessionVars().OptimizerFixControl,
@@ -3270,6 +3269,12 @@ func loadCollationParameter(ctx context.Context, se *session) (bool, error) {
 		"Unexpected value of 'new_collation_enabled' in 'mysql.tidb', use 'False' instead",
 		zap.String("value", para))
 	return false, nil
+}
+
+// DatabaseBasicInfo contains the basic information of a database.
+type DatabaseBasicInfo struct {
+	ID   int64
+	Name string
 }
 
 // TableBasicInfo contains the basic information of a table used in DDL.
