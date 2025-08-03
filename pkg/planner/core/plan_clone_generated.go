@@ -89,11 +89,11 @@ func (op *PhysicalIndexScan) CloneForPlanCache(newCtx base.PlanContext) (base.Pl
 func (op *PhysicalStreamAgg) CloneForPlanCache(newCtx base.PlanContext) (base.Plan, bool) {
 	cloned := new(PhysicalStreamAgg)
 	*cloned = *op
-	basePlan, baseOK := op.basePhysicalAgg.cloneForPlanCacheWithSelf(newCtx, cloned)
+	basePlan, baseOK := op.BasePhysicalAgg.CloneForPlanCacheWithSelf(newCtx, cloned)
 	if !baseOK {
 		return nil, false
 	}
-	cloned.basePhysicalAgg = *basePlan
+	cloned.BasePhysicalAgg = *basePlan
 	return cloned, true
 }
 
@@ -101,11 +101,11 @@ func (op *PhysicalStreamAgg) CloneForPlanCache(newCtx base.PlanContext) (base.Pl
 func (op *PhysicalHashAgg) CloneForPlanCache(newCtx base.PlanContext) (base.Plan, bool) {
 	cloned := new(PhysicalHashAgg)
 	*cloned = *op
-	basePlan, baseOK := op.basePhysicalAgg.cloneForPlanCacheWithSelf(newCtx, cloned)
+	basePlan, baseOK := op.BasePhysicalAgg.CloneForPlanCacheWithSelf(newCtx, cloned)
 	if !baseOK {
 		return nil, false
 	}
-	cloned.basePhysicalAgg = *basePlan
+	cloned.BasePhysicalAgg = *basePlan
 	return cloned, true
 }
 
@@ -123,18 +123,6 @@ func (op *PhysicalHashJoin) CloneForPlanCache(newCtx base.PlanContext) (base.Pla
 	if op.runtimeFilterList != nil {
 		return nil, false
 	}
-	return cloned, true
-}
-
-// CloneForPlanCache implements the base.Plan interface.
-func (op *PhysicalMergeJoin) CloneForPlanCache(newCtx base.PlanContext) (base.Plan, bool) {
-	cloned := new(PhysicalMergeJoin)
-	*cloned = *op
-	basePlan, baseOK := op.BasePhysicalJoin.CloneForPlanCacheWithSelf(newCtx, cloned)
-	if !baseOK {
-		return nil, false
-	}
-	cloned.BasePhysicalJoin = *basePlan
 	return cloned, true
 }
 
