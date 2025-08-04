@@ -424,26 +424,6 @@ func resolveIndicesForSort(pp base.PhysicalPlan) (err error) {
 	return err
 }
 
-// ResolveIndices implements Plan interface.
-func (p *PhysicalShuffle) ResolveIndices() (err error) {
-	err = p.BasePhysicalPlan.ResolveIndices()
-	if err != nil {
-		return err
-	}
-	// There may be one or more DataSource
-	for i := range p.ByItemArrays {
-		// Each DataSource has an array of HashByItems
-		for j := range p.ByItemArrays[i] {
-			// "Shuffle" get value of items from `DataSource`, other than children[0].
-			p.ByItemArrays[i][j], err = p.ByItemArrays[i][j].ResolveIndices(p.DataSources[i].Schema())
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return err
-}
-
 // resolveIndexForInlineProjection ensures that during the execution of the physical plan, the column index can
 // be correctly mapped to the column in its subplan.
 func resolveIndexForInlineProjection(p *physicalop.PhysicalSchemaProducer) error {
@@ -611,24 +591,6 @@ func (p *Update) ResolveIndices() (err error) {
 		}
 	}
 	return
-}
-
-// ResolveIndices implements Plan interface.
-func (p *PhysicalLock) ResolveIndices() (err error) {
-	err = p.BasePhysicalPlan.ResolveIndices()
-	if err != nil {
-		return err
-	}
-	for i, cols := range p.TblID2Handle {
-		for j, col := range cols {
-			resolvedCol, err := col.ResolveIndices(p.Children()[0].Schema())
-			if err != nil {
-				return err
-			}
-			p.TblID2Handle[i][j] = resolvedCol
-		}
-	}
-	return nil
 }
 
 // ResolveIndices implements Plan interface.
