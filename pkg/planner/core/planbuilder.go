@@ -576,8 +576,6 @@ func (b *PlanBuilder) Build(ctx context.Context, node *resolve.NodeW) (base.Plan
 		return b.buildDropBindPlan(x)
 	case *ast.SetBindingStmt:
 		return b.buildSetBindingStatusPlan(x)
-	case *ast.ChangeStmt:
-		return b.buildChange(x)
 	case *ast.SplitRegionStmt:
 		return b.buildSplitRegion(x)
 	case *ast.DistributeTableStmt:
@@ -599,13 +597,6 @@ func (b *PlanBuilder) buildSetConfig(ctx context.Context, v *ast.SetConfigStmt) 
 	}
 	expr, _, err := b.rewrite(ctx, v.Value, mockTablePlan, nil, true)
 	return &SetConfig{Name: v.Name, Type: v.Type, Instance: v.Instance, Value: expr}, err
-}
-
-func (*PlanBuilder) buildChange(v *ast.ChangeStmt) (base.Plan, error) {
-	exe := &Change{
-		ChangeStmt: v,
-	}
-	return exe, nil
 }
 
 func (b *PlanBuilder) buildExecute(ctx context.Context, v *ast.ExecuteStmt) (base.Plan, error) {
@@ -2103,8 +2094,9 @@ func (b *PlanBuilder) getMustAnalyzedColumns(tbl *resolve.TableNameW, cols *calc
 				}
 			}
 		}
+		relatedCols := make(map[int64]*expression.Column, len(tblInfo.Columns))
 		for len(virtualExprs) > 0 {
-			relatedCols := expression.ExtractColumnsFromExpressions(virtualExprs, nil)
+			expression.ExtractColumnsMapFromExpressionsWithReusedMap(relatedCols, nil, virtualExprs...)
 			virtualExprs = virtualExprs[:0]
 			for _, col := range relatedCols {
 				cols.data[col.ID] = struct{}{}
@@ -2112,6 +2104,7 @@ func (b *PlanBuilder) getMustAnalyzedColumns(tbl *resolve.TableNameW, cols *calc
 					virtualExprs = append(virtualExprs, col.VirtualExpr)
 				}
 			}
+			clear(relatedCols)
 		}
 	}
 	if tblInfo.PKIsHandle {
