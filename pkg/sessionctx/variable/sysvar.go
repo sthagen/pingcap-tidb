@@ -297,6 +297,10 @@ var defaultSysVars = []*SysVar{
 		s.OptimizerEnableNAAJ = TiDBOptOn(val)
 		return nil
 	}},
+	{Scope: vardef.ScopeGlobal | vardef.ScopeSession, Name: vardef.TiDBOptEnableSemiJoinRewrite, Value: BoolToOnOff(vardef.DefOptEnableSemiJoinRewrite), Type: vardef.TypeBool, SetSession: func(s *SessionVars, val string) error {
+		s.EnableSemiJoinRewrite = TiDBOptOn(val)
+		return nil
+	}},
 	{Scope: vardef.ScopeSession, Name: vardef.TiDBDDLReorgPriority, Value: "PRIORITY_LOW", Type: vardef.TypeEnum, skipInit: true, PossibleValues: []string{"PRIORITY_LOW", "PRIORITY_NORMAL", "PRIORITY_HIGH"}, SetSession: func(s *SessionVars, val string) error {
 		s.setDDLReorgPriority(val)
 		return nil
@@ -2056,6 +2060,10 @@ var defaultSysVars = []*SysVar{
 	}},
 	{Scope: vardef.ScopeGlobal | vardef.ScopeSession, Name: vardef.TiDBOptRiskGroupNDVSkewRatio, Value: strconv.FormatFloat(vardef.DefOptRiskGroupNDVSkewRatio, 'f', -1, 64), Type: vardef.TypeFloat, MinValue: 0, MaxValue: 1, SetSession: func(s *SessionVars, val string) error {
 		s.RiskGroupNDVSkewRatio = tidbOptFloat64(val, vardef.DefOptRiskGroupNDVSkewRatio)
+		return nil
+	}},
+	{Scope: vardef.ScopeGlobal | vardef.ScopeSession, Name: vardef.TiDBOptAlwaysKeepJoinKey, Value: BoolToOnOff(vardef.DefOptAlwaysKeepJoinKey), Type: vardef.TypeBool, SetSession: func(s *SessionVars, val string) error {
+		s.AlwaysKeepJoinKey = TiDBOptOn(val)
 		return nil
 	}},
 	{Scope: vardef.ScopeGlobal | vardef.ScopeSession, Name: vardef.TiDBOptCPUFactor, Value: strconv.FormatFloat(vardef.DefOptCPUFactor, 'f', -1, 64), Type: vardef.TypeFloat, MinValue: 0, MaxValue: math.MaxUint64, SetSession: func(s *SessionVars, val string) error {
