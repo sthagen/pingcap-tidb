@@ -22,6 +22,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/logicalop"
 	ruleutil "github.com/pingcap/tidb/pkg/planner/core/rule/util"
+	"github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/testdata"
 	"github.com/pingcap/tidb/pkg/types"
@@ -227,6 +228,46 @@ LIMIT 0,
 		"      └─TableReader 10000.00 root  data:Projection",
 		"        └─Projection 10000.00 cop[tikv]  json_extract(test.table_test.col16, $[].optUid)->Column#5, json_unquote(cast(json_extract(test.table_test.col17, $[0].value), var_string(16777216)))->Column#6",
 		"          └─TableFullScan 10000.00 cop[tikv] table:table_test keep order:false, stats:pseudo"))
+}
+
+func TestLogicalTopNPruneColumnsRefreshesSchemaBeforeInlineProjection(t *testing.T) {
+	ctx := mock.NewContext()
+	newColumn := func(id int64) *expression.Column {
+		return &expression.Column{
+			UniqueID: id,
+			RetType:  types.NewFieldType(mysql.TypeLonglong),
+		}
+	}
+
+	out1 := newColumn(1)
+	out2 := newColumn(2)
+	sortCol := newColumn(3)
+
+	child := logicalop.LogicalTableDual{RowCount: 1}.Init(ctx, 0)
+	child.SetSchema(expression.NewSchema(out1.Clone().(*expression.Column), out2.Clone().(*expression.Column), sortCol.Clone().(*expression.Column)))
+
+	topN := logicalop.LogicalTopN{
+		ByItems: []*util.ByItems{{Expr: sortCol.Clone(), Desc: false}},
+		Count:   1,
+	}.Init(ctx, 0)
+	topN.SetChildren(child)
+	topN.SetSchema(expression.NewSchema(
+		out1.Clone().(*expression.Column),
+		out2.Clone().(*expression.Column),
+		sortCol.Clone().(*expression.Column),
+		sortCol.Clone().(*expression.Column),
+	))
+
+	_, err := topN.PruneColumns([]*expression.Column{
+		out1.Clone().(*expression.Column),
+		out2.Clone().(*expression.Column),
+		sortCol.Clone().(*expression.Column),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 3, topN.Schema().Len())
+	require.Equal(t, int64(1), topN.Schema().Columns[0].UniqueID)
+	require.Equal(t, int64(2), topN.Schema().Columns[1].UniqueID)
+	require.Equal(t, int64(3), topN.Schema().Columns[2].UniqueID)
 }
 
 func TestLogicalExpandBuildKeyInfo(t *testing.T) {
