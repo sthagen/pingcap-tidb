@@ -92,11 +92,13 @@ func InitMetrics() {
 	InitResourceManagerMetrics()
 	InitServerMetrics()
 	InitSessionMetrics()
+	InitRUV2Metrics()
 	InitSliMetrics()
 	InitStatsMetrics()
 	InitTelemetryMetrics()
 	InitTopSQLMetrics()
 	InitTTLMetrics()
+	InitStmtSummaryMetrics()
 	dxfmetric.InitDistTaskMetrics()
 	ingestmetric.InitIngestMetrics()
 	InitResourceGroupMetrics()
@@ -325,6 +327,24 @@ func RegisterMetrics() {
 	prometheus.MustRegister(BindingCacheNumBindings)
 	prometheus.MustRegister(InternalSessions)
 	prometheus.MustRegister(ActiveUser)
+	prometheus.MustRegister(RUV2ResultChunkCells)
+	prometheus.MustRegister(RUV2ExecutorL1)
+	prometheus.MustRegister(RUV2ExecutorL2)
+	prometheus.MustRegister(RUV2ExecutorL3)
+	prometheus.MustRegister(RUV2ExecutorL5InsertRows)
+	prometheus.MustRegister(RUV2PlanCnt)
+	prometheus.MustRegister(RUV2PlanDeriveStatsPaths)
+	prometheus.MustRegister(RUV2ResourceManagerReadCnt)
+	prometheus.MustRegister(RUV2ResourceManagerWriteCnt)
+	prometheus.MustRegister(RUV2SessionParserTotal)
+	prometheus.MustRegister(RUV2TxnCnt)
+	prometheus.MustRegister(RUV2TiKVKVEngineCacheMiss)
+	prometheus.MustRegister(RUV2TiKVCoprocessorExecutorIterations)
+	prometheus.MustRegister(RUV2TiKVCoprocessorResponseBytes)
+	prometheus.MustRegister(RUV2TiKVRaftstoreStoreWriteTriggerWB)
+	prometheus.MustRegister(RUV2TiKVStorageProcessedKeysBatchGet)
+	prometheus.MustRegister(RUV2TiKVStorageProcessedKeysGet)
+	prometheus.MustRegister(RUV2TiKVCoprocessorWorkTotal)
 
 	prometheus.MustRegister(NetworkTransmissionStats)
 
@@ -369,6 +389,10 @@ func RegisterMetrics() {
 	prometheus.MustRegister(IndexLookRowsCounter)
 	prometheus.MustRegister(IndexLookUpExecutorRowNumber)
 	prometheus.MustRegister(IndexLookUpCopTaskCount)
+
+	// StmtSummary
+	prometheus.MustRegister(StmtSummaryWindowRecordCount)
+	prometheus.MustRegister(StmtSummaryWindowEvictedCount)
 }
 
 // Register registers custom collectors.
