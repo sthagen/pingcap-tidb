@@ -1725,11 +1725,10 @@ func (a *ExecStmt) finalizeStatementRUV2Metrics() {
 	if dctx == nil || dctx.RUConsumptionReporter == nil || len(dctx.ResourceGroupName) == 0 {
 		return
 	}
-	if tikvRU := ruDetail.TiKVRUV2(); tikvRU > 0 {
-		dctx.RUConsumptionReporter.ReportTiKVRUV2Consumption(dctx.ResourceGroupName, tikvRU)
-	}
-	if tidbRU > 0 {
-		dctx.RUConsumptionReporter.ReportTiDBRUV2Consumption(dctx.ResourceGroupName, tidbRU)
+	tikvRU := ruDetail.TiKVRUV2()
+	tiflashRU := ruDetail.TiflashRU()
+	if tikvRU > 0 || tidbRU > 0 || tiflashRU > 0 {
+		dctx.RUConsumptionReporter.ReportRUV2Consumption(dctx.ResourceGroupName, tikvRU, tidbRU, tiflashRU)
 	}
 }
 
@@ -1909,10 +1908,12 @@ func (a *ExecStmt) LogSlowQuery(txnTS uint64, succ bool, hasMoreResults bool) {
 		executor_metrics.TotalQueryProcHistogramInternal.Observe(costTime.Seconds())
 		executor_metrics.TotalCopProcHistogramInternal.Observe(execDetail.TimeDetail.ProcessTime.Seconds())
 		executor_metrics.TotalCopWaitHistogramInternal.Observe(execDetail.TimeDetail.WaitTime.Seconds())
+		executor_metrics.SlowQueryCounterInternal.Inc()
 	} else {
 		executor_metrics.TotalQueryProcHistogramGeneral.Observe(costTime.Seconds())
 		executor_metrics.TotalCopProcHistogramGeneral.Observe(execDetail.TimeDetail.ProcessTime.Seconds())
 		executor_metrics.TotalCopWaitHistogramGeneral.Observe(execDetail.TimeDetail.WaitTime.Seconds())
+		executor_metrics.SlowQueryCounterGeneral.Inc()
 		if execDetail.ScanDetail != nil && execDetail.ScanDetail.ProcessedKeys != 0 {
 			executor_metrics.CopMVCCRatioHistogramGeneral.Observe(float64(execDetail.ScanDetail.TotalKeys) / float64(execDetail.ScanDetail.ProcessedKeys))
 		}
