@@ -861,13 +861,13 @@ func getPushedDownTopN(p *physicalop.PhysicalTopN, childPlan base.PhysicalPlan, 
 	fixValue := fixcontrol.GetBoolWithDefault(p.SCtx().GetSessionVars().GetOptimizerFixControlMap(), fixcontrol.Fix56318, true)
 	// HeavyFunctionOptimize: if TopN's ByItems is a HeavyFunction (currently mainly for Vector Search), we will change
 	// the ByItems in order to reuse the function result.
-	byItemIndex := make([]int, 0)
+	heavyByItemIndexes := make([]int, 0)
 	for i, byItem := range p.ByItems {
 		if ContainHeavyFunction(byItem.Expr) {
-			byItemIndex = append(byItemIndex, i)
+			heavyByItemIndexes = append(heavyByItemIndexes, i)
 		}
 	}
-	if fixValue && len(byItemIndex) > 0 {
+	if fixValue && len(heavyByItemIndexes) > 0 {
 		x, err := p.Clone(p.SCtx())
 		if err != nil {
 			return nil, nil
@@ -917,11 +917,12 @@ func getPushedDownTopN(p *physicalop.PhysicalTopN, childPlan base.PhysicalPlan, 
 			DistanceCol *expression.Column
 		}
 		distanceCols := make([]DistanceColItem, 0)
-		for _, idx := range byItemIndex {
+		for _, idx := range heavyByItemIndexes {
 			bottomProjExprs = append(bottomProjExprs, newGlobalTopN.ByItems[idx].Expr)
 			distanceCol := &expression.Column{
 				UniqueID: newGlobalTopN.SCtx().GetSessionVars().AllocPlanColumnID(),
 				RetType:  newGlobalTopN.ByItems[idx].Expr.GetType(p.SCtx().GetExprCtx().GetEvalCtx()),
+				Index:    len(bottomProjExprs) - 1,
 			}
 			distanceCols = append(distanceCols, DistanceColItem{
 				Index:       idx,
@@ -954,13 +955,11 @@ func getPushedDownTopN(p *physicalop.PhysicalTopN, childPlan base.PhysicalPlan, 
 		}
 		topN.SetChildren(bottomProj)
 
-		// orderByCol is the column `distanceCol`, so this explain always success.
-		orderByCol, _ := topN.ByItems[0].Expr.(*expression.Column)
-		orderByCol.Index = len(bottomProj.Exprs) - 1
-
-		// try to Check and modify plan when it is possible to not scanning vector column at all.
-		tryReturnDistanceFromIndex(topN, newGlobalTopN, childPlan, bottomProj)
-
+		// Only try to skip scanning the vector column when the first order-by item is the vector
+		// distance (i.e. vector index can be chosen).
+		if len(heavyByItemIndexes) == 1 && heavyByItemIndexes[0] == 0 {
+			tryReturnDistanceFromIndex(topN, newGlobalTopN, childPlan, bottomProj)
+		}
 		return topN, newGlobalTopN
 	}
 
@@ -991,7 +990,10 @@ func tryReturnDistanceFromIndex(local, global *physicalop.PhysicalTopN, childPla
 		return false
 	}
 
-	orderByCol, _ := local.ByItems[0].Expr.(*expression.Column)
+	orderByCol, ok := local.ByItems[0].Expr.(*expression.Column)
+	if !ok {
+		return false
+	}
 	var annQueryInfo *physicalop.ColumnarIndexExtra
 	for _, idx := range tableScan.UsedColumnarIndexes {
 		if idx != nil && idx.QueryInfo.IndexType == tipb.ColumnarIndexType_TypeVector && idx.QueryInfo != nil {
@@ -1069,7 +1071,7 @@ func tryReturnDistanceFromIndex(local, global *physicalop.PhysicalTopN, childPla
 	// modify the topN's ByItem
 	local.ByItems[0].Expr = virtualDistanceCol
 	global.ByItems[0].Expr = virtualDistanceCol
-	local.ByItems[0].Expr.(*expression.Column).Index = tableScan.Schema().Len() - 1
+	virtualDistanceCol.Index = tableScan.Schema().Len() - 1
 
 	return true
 }
