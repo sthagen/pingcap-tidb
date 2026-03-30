@@ -1963,7 +1963,6 @@ func (s *session) Parse(ctx context.Context, sql string) ([]ast.StmtNode, error)
 		session_metrics.SessionExecuteParseDurationInternal.Observe(durParse.Seconds())
 	} else {
 		session_metrics.SessionExecuteParseDurationGeneral.Observe(durParse.Seconds())
-		metrics.RUV2SessionParserTotal.Inc()
 		s.sessionVars.RUV2PendingSessionParserTotal.Add(1)
 	}
 	for _, warn := range warns {
@@ -2011,7 +2010,6 @@ func (s *session) ParseWithParams(ctx context.Context, sql string, args ...any) 
 		session_metrics.SessionExecuteParseDurationInternal.Observe(durParse.Seconds())
 	} else {
 		session_metrics.SessionExecuteParseDurationGeneral.Observe(durParse.Seconds())
-		metrics.RUV2SessionParserTotal.Inc()
 		s.sessionVars.RUV2PendingSessionParserTotal.Add(1)
 	}
 	for _, warn := range warns {
@@ -2595,8 +2593,13 @@ func (s *session) executeStmtImpl(ctx context.Context, stmtNode ast.StmtNode) (s
 			if !variable.ErrUnknownSystemVar.Equal(err) {
 				sql := stmtNode.Text()
 				sql = parser.Normalize(sql, s.sessionVars.EnableRedactLog)
-				logutil.Logger(ctx).Warn("compile SQL failed", zap.Error(err),
-					zap.String("SQL", sql))
+				if sql == `select $$` {
+					logutil.Logger(ctx).Debug("compile SQL failed, expected for this query", zap.Error(err),
+						zap.String("SQL", sql))
+				} else {
+					logutil.Logger(ctx).Warn("compile SQL failed", zap.Error(err),
+						zap.String("SQL", sql))
+				}
 			}
 		}
 		return nil, err
@@ -5001,7 +5004,6 @@ func (s *session) recordOnTransactionExecution(err error, counter int, duration 
 			}
 		}
 	}
-	metrics.RUV2TxnCnt.Inc()
 	if s.sessionVars.RUV2Metrics != nil {
 		s.sessionVars.RUV2Metrics.AddTxnCnt(1)
 	}

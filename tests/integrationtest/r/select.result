@@ -729,3 +729,5 @@ SELECT * FROM t1 STRAIGHT_JOIN t2 USING(i);
 Error 1054 (42S22): Unknown column 'i' in 'from clause'
 SELECT * FROM t1 STRAIGHT_JOIN t3 USING(id);
 Error 1054 (42S22): Unknown column 'id' in 'from clause'
+select $$;
+Error 1054 (42S22): Unknown column '$$' in 'field list'

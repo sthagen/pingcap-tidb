@@ -545,6 +545,37 @@ HAVING EXISTS (SELECT 1 FROM t_panic WHERE x IS NULL);`).Check(testkit.Rows("<ni
 		tk.MustQuery("select * from t1;").Check(testkit.Rows("1 <nil> "))
 	}
 
+	// abs-max-binary-literal-group-by-unique-key
+	{
+		tk := prepareSharedTestKit(t)
+		expectedRows := testkit.Rows("0")
+		expectedWarnings := testkit.RowsWithSep("|", "Warning|1292|Truncated incorrect DOUBLE value: '*'")
+		runQuery := func(createTableSQL, query string) (rows, warnings [][]any) {
+			t.Helper()
+			tk.MustExec("drop table if exists t0")
+			tk.MustExec(createTableSQL)
+			tk.MustExec("insert ignore into t0 values (1)")
+			rows = tk.MustQuery(query).Rows()
+			warnings = tk.MustQuery("show warnings").Rows()
+			return
+		}
+
+		for _, aggFunc := range []string{"max", "min"} {
+			query := fmt.Sprintf("select abs(%s(b'101010')) as c3 from t0 as tom8 group by tom8.c0", aggFunc)
+			uniqueRows, uniqueWarnings := runQuery("create table t0(c0 numeric zerofill not null unique)", query)
+			plainRows, plainWarnings := runQuery("create table t0(c0 numeric)", query)
+
+			require.Equalf(t, expectedRows, uniqueRows,
+				"aggFunc=%s uniqueWarnings=%v", aggFunc, uniqueWarnings)
+			require.Equalf(t, expectedRows, plainRows,
+				"aggFunc=%s plainWarnings=%v", aggFunc, plainWarnings)
+			require.Equalf(t, expectedWarnings, uniqueWarnings,
+				"aggFunc=%s uniqueRows=%v", aggFunc, uniqueRows)
+			require.Equalf(t, expectedWarnings, plainWarnings,
+				"aggFunc=%s plainRows=%v", aggFunc, plainRows)
+		}
+	}
+
 	// join-reorder-adds-selection
 	{
 		tk := prepareSharedTestKit(t)

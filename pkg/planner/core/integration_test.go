@@ -2342,6 +2342,17 @@ func TestIssue66619(t *testing.T) {
 		Check(testkit.Rows("20"))
 	tk.MustQuery("select /* issue:66947 derived-filter */ hex(ref0) from (select t0.c0 as ref0, (sum(t0.c0) > -1 and char_length(t0.c0)) as ref1 from t0 group by t0.c0) as s where ref1").
 		Check(testkit.Rows("20"))
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("create table t1 (c1 decimal not null)")
+	tk.MustExec("insert into t1 values (-1000000000)")
+	tk.MustQuery("select /* issue:67237 not-null */ c1 from t1 where ifnull(c1, '') = c1").
+		Check(testkit.Rows("-1000000000"))
+
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("create table t1 (c1 decimal)")
+	tk.MustExec("insert into t1 values (-1000000000)")
+	tk.MustQuery("select /* issue:67237 nullable */ c1 from t1 where ifnull(c1, '') = c1").
+		Check(testkit.Rows("-1000000000"))
 
 	tk.MustExec("drop table if exists t0")
 	tk.MustExec("create table t0(c0 float unique, c1 numeric zerofill, c2 text(192))")
