@@ -810,10 +810,10 @@ func TestSplitRangeForTable(t *testing.T) {
 	})
 
 	var addCnt, removeCnt atomic.Int32
-	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/lightning/backend/local/AddPartitionRangeForTable", func() {
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ingestor/ingestctrl/AddPartitionRangeForTable", func() {
 		addCnt.Add(1)
 	})
-	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/lightning/backend/local/RemovePartitionRangeRequest", func() {
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ingestor/ingestctrl/RemovePartitionRangeRequest", func() {
 		removeCnt.Add(1)
 	})
 
@@ -837,7 +837,7 @@ func TestSplitRangeForTable(t *testing.T) {
 			// 2. Verify large table case (mocked by lowering threshold)
 			// We only need to verify the logic once for the local backend logic.
 			if tc.caseName == "local ingest" {
-				testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/lightning/backend/local/ForcePartitionRegionThreshold", func(threshold *int) {
+				testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ingestor/ingestctrl/ForcePartitionRegionThreshold", func(threshold *int) {
 					*threshold = 0
 				})
 				addCnt.Store(0)
@@ -886,10 +886,10 @@ func TestSplitRangeForPartitionTable(t *testing.T) {
 	for i, tc := range testcases {
 		t.Run(tc.caseName, func(t *testing.T) {
 			var addCnt, removeCnt atomic.Int32
-			testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/lightning/backend/local/AddPartitionRangeForTable", func() {
+			testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ingestor/ingestctrl/AddPartitionRangeForTable", func() {
 				addCnt.Add(1)
 			})
-			testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/lightning/backend/local/RemovePartitionRangeRequest", func() {
+			testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ingestor/ingestctrl/RemovePartitionRangeRequest", func() {
 				removeCnt.Add(1)
 			})
 
@@ -910,7 +910,7 @@ func TestSplitRangeForPartitionTable(t *testing.T) {
 
 			// 2. Verify large table case (mocked by lowering threshold)
 			if tc.caseName == "local ingest" {
-				testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/lightning/backend/local/ForcePartitionRegionThreshold", func(threshold *int) {
+				testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ingestor/ingestctrl/ForcePartitionRegionThreshold", func(threshold *int) {
 					*threshold = 0
 				})
 				addCnt.Store(0)
@@ -1028,7 +1028,9 @@ func TestNextGenMetering(t *testing.T) {
 			items["index_kv_bytes"].(int64) == 153 &&
 			items[metering.RequiredSlotsField].(int) == task.RequiredSlots &&
 			items[metering.MaxNodeCountField].(int) == task.MaxNodeCount &&
-			items[metering.DurationSecondsField].(int64) > 0
+			// duration_seconds uses integer seconds; tasks finishing in <1s
+			// are truncated to 0.
+			items[metering.DurationSecondsField].(int64) >= 0
 	}, 30*time.Second, 100*time.Millisecond)
 }
 
