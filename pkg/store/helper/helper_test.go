@@ -111,8 +111,8 @@ func TestGetRegionsTableInfo(t *testing.T) {
 func TestGetRegionsTableInfoWithKeyspace(t *testing.T) {
 	keyspaceID := uint32(1)
 	codecV2, err := tikv.NewCodecV2(tikv.ModeTxn, &keyspacepb.KeyspaceMeta{
-		Id:   keyspaceID,
-		Name: "test_keyspace",
+		Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: keyspaceID},
+		Name:     "test_keyspace",
 	})
 	require.NoError(t, err)
 
@@ -188,7 +188,7 @@ func TestGetRegionsTableInfoWithKeyspace(t *testing.T) {
 // clusters.
 func TestGetPDRegionStatsKeyspaceEncoding(t *testing.T) {
 	keyspaceID := uint32(1)
-	keyspaceMeta := &keyspacepb.KeyspaceMeta{Id: keyspaceID, Name: "test_keyspace"}
+	keyspaceMeta := &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: keyspaceID}, Name: "test_keyspace"}
 	codecV2, err := tikv.NewCodecV2(tikv.ModeTxn, keyspaceMeta)
 	require.NoError(t, err)
 
@@ -642,6 +642,57 @@ func TestComputeTiFlashStatus(t *testing.T) {
 	for i := 1000; i < 3000; i++ {
 		_, ok := regionReplica2[int64(i)]
 		require.True(t, ok)
+	}
+}
+
+func TestCollectColumnarStatusFTSIndexReady(t *testing.T) {
+	testCases := []struct {
+		name             string
+		response         string
+		ftsIndexReady    uint
+		hasFtsIndexReady bool
+	}{
+		{
+			name:             "present",
+			response:         `{"ready":3,"vector-index-ready":2,"fts-index-ready":1,"total":4}`,
+			ftsIndexReady:    1,
+			hasFtsIndexReady: true,
+		},
+		{
+			name:             "present zero",
+			response:         `{"ready":3,"vector-index-ready":2,"fts-index-ready":0,"total":4}`,
+			ftsIndexReady:    0,
+			hasFtsIndexReady: true,
+		},
+		{
+			name:             "missing on older TiKV",
+			response:         `{"ready":3,"vector-index-ready":2,"total":4}`,
+			ftsIndexReady:    0,
+			hasFtsIndexReady: false,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, "/kvengine/columnar_status", r.URL.Path)
+				require.Equal(t, "7", r.URL.Query().Get("keyspace_id"))
+				require.Equal(t, "9", r.URL.Query().Get("table_id"))
+				require.Equal(t, "11", r.URL.Query().Get("index_id"))
+				_, err := w.Write([]byte(testCase.response))
+				require.NoError(t, err)
+			}))
+			defer server.Close()
+
+			indexID := int64(11)
+			status, err := helper.CollectColumnarStatusWithCtx(context.Background(), strings.TrimPrefix(server.URL, "http://"), 7, 9, &indexID)
+			require.NoError(t, err)
+			require.Equal(t, uint(3), status.Ready)
+			require.Equal(t, uint(2), status.VectorIndexReady)
+			require.Equal(t, testCase.ftsIndexReady, status.FtsIndexReady)
+			require.Equal(t, testCase.hasFtsIndexReady, status.HasFtsIndexReady)
+			require.Equal(t, uint(4), status.Total)
+		})
 	}
 }
 
