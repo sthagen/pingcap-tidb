@@ -17,12 +17,14 @@ package executor
 import (
 	"testing"
 
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/kv"
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/logicalop"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
 	"github.com/pingcap/tidb/pkg/planner/property"
+	"github.com/pingcap/tidb/pkg/resourcegroup/ruv3"
 	"github.com/pingcap/tidb/pkg/util/execdetails"
 	"github.com/pingcap/tidb/pkg/util/mock"
 	"github.com/pingcap/tipb/go-tipb"
@@ -233,7 +235,7 @@ func BenchmarkStatementRUForestCalculation(b *testing.B) {
 			setup := statementRUCalculationSetup{frontendCompileBytes: 7}
 
 			b.Run("result-only", func(b *testing.B) {
-				if _, ok := calculateStatementRU(flat, coll, nil, setup, true); !ok {
+				if _, ok := calculateStatementRU(flat, coll, nil, statementRUWriteSnapshot{}, setup, true); !ok {
 					b.Fatal("benchmark fixture must complete ResultOnly calculation")
 				}
 				b.ResetTimer()
@@ -242,7 +244,7 @@ func BenchmarkStatementRUForestCalculation(b *testing.B) {
 				// publication are outside the timed region.
 				b.ReportAllocs()
 				for b.Loop() {
-					finalized, ok := calculateStatementRU(flat, coll, nil, setup, true)
+					finalized, ok := calculateStatementRU(flat, coll, nil, statementRUWriteSnapshot{}, setup, true)
 					statementRUFinalizedSink = finalized
 					statementRUCalculatedSink = ok
 				}
@@ -263,7 +265,7 @@ func BenchmarkStatementRUForestCalculation(b *testing.B) {
 			})
 
 			b.Run("explain-calculation", func(b *testing.B) {
-				if _, result, ok := calculateStatementRUWithOperators(flat, coll, nil, setup, true); !ok || result == nil {
+				if _, result, ok := calculateStatementRUWithOperators(flat, coll, nil, statementRUWriteSnapshot{}, setup, true); !ok || result == nil {
 					b.Fatal("benchmark fixture must complete EXPLAIN calculation")
 				}
 				b.ResetTimer()
@@ -271,7 +273,7 @@ func BenchmarkStatementRUForestCalculation(b *testing.B) {
 				// It excludes EXPLAIN row formatting and SQL execution.
 				b.ReportAllocs()
 				for b.Loop() {
-					finalized, result, ok := calculateStatementRUWithOperators(flat, coll, nil, setup, true)
+					finalized, result, ok := calculateStatementRUWithOperators(flat, coll, nil, statementRUWriteSnapshot{}, setup, true)
 					statementRUFinalizedSink = finalized
 					statementRUExplainSink = result
 					statementRUCalculatedSink = ok
@@ -281,10 +283,96 @@ func BenchmarkStatementRUForestCalculation(b *testing.B) {
 	}
 }
 
+func BenchmarkStatementRUPointLookupEvidence(b *testing.B) {
+	const planID = 1
+	complete := statementRUPointResponseStatsForTestFromResponse(
+		&kvrpcpb.ScanDetailV2{
+			TotalVersions:         2,
+			ProcessedVersions:     1,
+			ProcessedVersionsSize: 37,
+		},
+		17,
+	)
+	for _, testCase := range []struct {
+		name  string
+		stats statementRUPointResponseStatsForTest
+	}{
+		{name: "local-no-response"},
+		{name: "complete-response", stats: statementRUPointResponseStatsForTest{stats: complete}},
+	} {
+		b.Run(testCase.name, func(b *testing.B) {
+			runtimeStats := execdetails.NewRuntimeStatsColl(nil)
+			runtimeStats.RegisterStats(planID, &testCase.stats)
+			b.ReportAllocs()
+			for b.Loop() {
+				calculator := statementRUCalculator{}
+				statementRUOperatorSink = statementRUOperatorResult{
+					state: collectStatementRUPointLookupEvidence(planID, runtimeStats, &calculator),
+				}
+				statementRUCalculatorSink = calculator
+			}
+		})
+	}
+}
+
+func BenchmarkStatementRUPointDirectCalculator(b *testing.B) {
+	const planID = 1
+	runtimeStats := execdetails.NewRuntimeStatsColl(nil)
+	stats := statementRUPointResponseStatsForTest{stats: statementRUPointResponseStatsForTestFromResponse(
+		&kvrpcpb.ScanDetailV2{
+			TotalVersions:         2,
+			ProcessedVersions:     1,
+			ProcessedVersionsSize: 37,
+		},
+		17,
+	)}
+	runtimeStats.RegisterStats(planID, &stats)
+	metrics := execdetails.NewRUV2Metrics()
+	metrics.AddTiKVCoprocessorResponseBytes(29)
+	setup := statementRUCalculationSetup{frontendCompileBytes: 23}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		finalized, ok := calculateStatementRUPointLookup(planID, runtimeStats, metrics, setup, true)
+		if !ok {
+			b.Fatal("valid point response failed to finalize")
+		}
+		statementRUFinalizedSink = finalized
+	}
+}
+
+func BenchmarkStatementRUPointGeneralCalculator(b *testing.B) {
+	fixture := newStatementRUSimpleSelectFixture(b)
+	plan := newStatementRUPointLookupPlanForTest(fixture, false)
+	flat := plannercore.FlattenPhysicalPlan(plan, false)
+	runtimeStats := execdetails.NewRuntimeStatsColl(nil)
+	stats := statementRUPointResponseStatsForTest{stats: statementRUPointResponseStatsForTestFromResponse(
+		&kvrpcpb.ScanDetailV2{
+			TotalVersions:         2,
+			ProcessedVersions:     1,
+			ProcessedVersionsSize: 37,
+		},
+		17,
+	)}
+	runtimeStats.RegisterStats(plan.ID(), &stats)
+	metrics := execdetails.NewRUV2Metrics()
+	metrics.AddTiKVCoprocessorResponseBytes(29)
+	setup := statementRUCalculationSetup{frontendCompileBytes: 23}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		finalized, ok := calculateStatementRU(flat, runtimeStats, metrics, statementRUWriteSnapshot{}, setup, true)
+		if !ok {
+			b.Fatal("valid point response failed to finalize")
+		}
+		statementRUFinalizedSink = finalized
+	}
+}
+
 func BenchmarkStatementRUFinalizePublication(b *testing.B) {
 	fixture := newStatementRUSimpleSelectFixture(b)
 	calculator := statementRUCalculator{
-		units: statementRURawUnits{
+		units: ruv3.StmtUnits{
 			CPUWork:              5,
 			ScanBytes:            10,
 			NetBytes:             20,
