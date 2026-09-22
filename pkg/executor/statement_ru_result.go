@@ -19,35 +19,26 @@ import (
 
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/planner/core/base"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
-	"github.com/pingcap/tidb/pkg/resourcegroup/ruv3"
+	"github.com/pingcap/tidb/pkg/resourcegroup/ruv2"
+	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 )
 
 // currentStatementRUWeights reads the loaded config rather than capturing
 // package-initialization defaults. RU v3 shares the ru-v2 config section while
 // replacing the legacy model; its statement weights are not dynamically reloadable.
-func currentStatementRUWeights() ruv3.StmtWeights {
-	weights := config.DefaultRUV2Config()
+func currentStatementRUWeights() ruv2.StmtWeights {
+	weights := ruv2.DefaultWeights()
 	if cfg := config.GetGlobalConfig(); cfg != nil {
-		weights = cfg.RUV2
+		weights = cfg.RUV2.StmtWeights
 	}
-	return ruv3.StmtWeights{
-		CPUWork:             weights.StatementCPUWork,
-		ScanByte:            weights.StatementScanBytes,
-		NetByte:             weights.StatementNetBytes,
-		FrontendCompileByte: weights.StatementFrontendCompileBytes,
-		HashStateRow:        weights.StatementHashStateRows,
-		JoinOutputRow:       weights.StatementJoinOutputRows,
-		WriteStatement:      weights.StatementWriteStatement,
-		OperatorNum:         weights.StatementOperatorNum,
-		WriteKey:            weights.StatementWriteKeys,
-		WriteByte:           weights.StatementWriteBytes,
-	}
+	return weights
 }
 
 // The current producers cannot prove that all successful or canceled remote
@@ -81,30 +72,42 @@ func (state statementRUCalibrationState) String() string {
 
 type statementRUCalibrationSnapshot struct {
 	State statementRUCalibrationState
-	Units ruv3.StmtUnits
+	Units ruv2.StmtUnits
 }
 
 // statementRUCalculationSetup is installed once for an eligible statement
-// and cleared by the first terminal attempt. It contains no plan pointer,
-// topology state, publication mode, or consumer.
+// and cleared by the first terminal attempt. It snapshots the reporting mode
+// and contains no plan pointer, topology state, or consumer.
 type statementRUCalculationSetup struct {
 	frontendCompileBytes float64
+	fullReport           bool
 }
 
-// statementRUFinalizedSnapshot contains only values. It cannot retain an ExecStmt,
-// FlatOperator, Origin, flat plan, calculator, or ExecDetails pointer.
+// statementRUFinalizedSnapshot owns scalar results and an optional full-mode
+// report of numeric values. It retains no plan, executor, or runtime statistics.
 type statementRUFinalizedSnapshot struct {
-	units            ruv3.StmtUnits
-	result           ruv3.StmtResult
+	units            ruv2.StmtUnits
+	result           ruv2.StmtResult
 	calibrationState statementRUCalibrationState
-	writeSQL         bool
+	sqlType          string
+	engineRU         statementRUEngineResult
+	report           *statementRUFullReport
+	failure          statementRUFailureReason
+	ttlJob           bool
 }
 
 func installStatementRUOwner(stmt *ExecStmt) {
 	setup, ok := newStatementRUCalculationSetup(stmt)
+	fullReport := config.GetGlobalConfig().RUV2.ReportMode == config.RUReportModeFull
 	if !ok {
+		// Restricted work is outside the user-statement calibration population.
+		if fullReport && stmt != nil && stmt.Ctx != nil && stmt.Ctx.GetSessionVars() != nil &&
+			!stmt.Ctx.GetSessionVars().InRestrictedSQL {
+			publishStatementRUFailureSafely(statementRUIneligible)
+		}
 		return
 	}
+	setup.fullReport = fullReport
 	owner := newStatementRUOwner(stmt)
 	owner.calculationSetup = setup
 	stmt.statementRUOwner = owner
@@ -115,13 +118,15 @@ func newStatementRUCalculationSetup(stmt *ExecStmt) (statementRUCalculationSetup
 		return statementRUCalculationSetup{}, false
 	}
 	sessVars := stmt.Ctx.GetSessionVars()
-	_, isAnalyze := stmt.Plan.(*plannercore.Analyze)
+	planInfo := classifyStatementRUPlan(stmt.Plan)
 	if sessVars == nil || sessVars.StmtCtx == nil {
 		return statementRUCalculationSetup{}, false
 	}
-	eligible := sessVars.StmtCtx.IsReadOnly || isAnalyze || statementRUIsWritePlan(stmt.Plan) || statementRUIsCommitPlan(stmt.Plan)
+	// Locking SELECTs still perform reads even though they are not read-only.
+	eligible := sessVars.StmtCtx.IsReadOnly || sessVars.StmtCtx.InSelectStmt ||
+		planInfo.kind == statementRUPlanAnalyze || planInfo.kind == statementRUPlanWrite || planInfo.kind == statementRUPlanCommit
 	if !eligible ||
-		sessVars.InRestrictedSQL || sessVars.HasStatusFlag(mysql.ServerStatusCursorExists) ||
+		(sessVars.InRestrictedSQL && !isStatementRUTTLJob(sessVars)) || sessVars.HasStatusFlag(mysql.ServerStatusCursorExists) ||
 		sessVars.StmtCtx.GetFlatPlan() != nil {
 		return statementRUCalculationSetup{}, false
 	}
@@ -131,26 +136,64 @@ func newStatementRUCalculationSetup(stmt *ExecStmt) (statementRUCalculationSetup
 	}, true
 }
 
-// statementRUIsWritePlan classifies DML independently of affected rows.
-func statementRUIsWritePlan(plan base.Plan) bool {
-	// Prepared statements are unwrapped by Exec after owner installation.
-	if execute, ok := plan.(*plannercore.Execute); ok {
-		plan = execute.Plan
-	}
-	switch plan.(type) {
-	case *physicalop.Insert, *physicalop.Update, *physicalop.Delete:
-		return true
-	}
-	return false
+func isStatementRUTTLJob(vars *variable.SessionVars) bool {
+	return vars.InRestrictedSQL && vars.RequestSourceType == kv.InternalTxnTTL && vars.TTLJobID != ""
 }
 
-func statementRUIsCommitPlan(plan base.Plan) bool {
-	simple, ok := plan.(*plannercore.Simple)
-	if !ok {
-		return false
+type statementRUPlanKind uint8
+
+const (
+	statementRUPlanOther statementRUPlanKind = iota
+	statementRUPlanWrite
+	statementRUPlanCommit
+	statementRUPlanAnalyze
+	statementRUPlanPointLookup
+)
+
+// statementRUPlanInfo is local to an execution phase: retries can rebuild the plan.
+// Other plans still use the statement context for read eligibility.
+type statementRUPlanInfo struct {
+	plan    base.Plan
+	kind    statementRUPlanKind
+	sqlType string
+}
+
+// classifyStatementRUPlan resolves executing wrappers and classifies the target
+// in one traversal, independently of affected rows or committed keys. A plain
+// EXPLAIN only renders a plan and must never charge its unexecuted target.
+func classifyStatementRUPlan(plan base.Plan) statementRUPlanInfo {
+	info := statementRUPlanInfo{plan: plan, sqlType: "select"}
+	for {
+		switch plan := info.plan.(type) {
+		case *plannercore.Execute:
+			// Owner installation happens before Exec unwraps prepared statements.
+			info.plan = plan.Plan
+			continue
+		case *plannercore.Explain:
+			if plan.Analyze {
+				info.plan = plan.TargetPlan
+				continue
+			}
+		case *physicalop.Insert:
+			info.kind, info.sqlType = statementRUPlanWrite, "insert"
+			if plan.IsReplace {
+				info.sqlType = "replace"
+			}
+		case *physicalop.Update:
+			info.kind, info.sqlType = statementRUPlanWrite, "update"
+		case *physicalop.Delete:
+			info.kind, info.sqlType = statementRUPlanWrite, "delete"
+		case *plannercore.Analyze:
+			info.kind, info.sqlType = statementRUPlanAnalyze, "analyze"
+		case *plannercore.Simple:
+			if _, ok := plan.Statement.(*ast.CommitStmt); ok {
+				info.kind, info.sqlType = statementRUPlanCommit, "commit"
+			}
+		case *physicalop.PointGetPlan, *physicalop.BatchPointGetPlan:
+			info.kind = statementRUPlanPointLookup
+		}
+		return info
 	}
-	_, ok = simple.Statement.(*ast.CommitStmt)
-	return ok
 }
 
 func statementRUFrontendCompileBytes(stmt *ExecStmt) float64 {
@@ -160,8 +203,12 @@ func statementRUFrontendCompileBytes(stmt *ExecStmt) float64 {
 
 	sql := stmt.StmtNode.OriginalText()
 	if stmt.Ctx != nil {
-		if sessVars := stmt.Ctx.GetSessionVars(); sessVars != nil &&
-			sessVars.StmtCtx != nil && sessVars.StmtCtx.OriginalSQL != "" {
+		sessVars := stmt.Ctx.GetSessionVars()
+		// Both prepared and non-prepared cache hits skip plan compilation.
+		if sessVars != nil && sessVars.FoundInPlanCache {
+			return 0
+		}
+		if sessVars != nil && sessVars.StmtCtx != nil && sessVars.StmtCtx.OriginalSQL != "" {
 			stmtCtx := sessVars.StmtCtx
 			normalizedSQL, _ := stmtCtx.SQLDigest()
 			normalizedSQL = trimStatementRUExplainPrefix(normalizedSQL)
@@ -194,15 +241,21 @@ func trimStatementRUExplainPrefix(normalizedSQL string) string {
 // statementRUCalculator is terminal-local. It accumulates only typed scalar
 // units; no plan or execution-detail pointer survives calculateStatementRU.
 type statementRUCalculator struct {
-	units ruv3.StmtUnits
+	units   ruv2.StmtUnits
+	compute [statementRUEngineCount]statementRUComputeUnits
+	report  *statementRUFullReport
 }
 
 func newStatementRUCalculator(setup statementRUCalculationSetup) statementRUCalculator {
-	return statementRUCalculator{
-		units: ruv3.StmtUnits{
+	calculator := statementRUCalculator{
+		units: ruv2.StmtUnits{
 			FrontendCompileBytes: setup.frontendCompileBytes,
 		},
 	}
+	if setup.fullReport {
+		calculator.report = new(statementRUFullReport)
+	}
+	return calculator
 }
 
 type statementRUScanEvidenceState uint8
@@ -247,15 +300,35 @@ func classifyStatementRUScanEvidence(totalKeys, processedKeys, processedBytes in
 }
 
 func (calculator statementRUCalculator) finalize() (statementRUFinalizedSnapshot, bool) {
-	result, ok := ruv3.Calculate(calculator.units, currentStatementRUWeights())
+	weights := currentStatementRUWeights()
+	result, ok := ruv2.Calculate(calculator.units, weights)
 	if !ok {
-		return statementRUFinalizedSnapshot{}, false
+		return statementRUFailed(statementRUOperatorInvalid), false
+	}
+	engineRU := calculator.engineResult(weights)
+	// TotalRU already includes the original TiFlash RU, so add only the extra
+	// (multiplier - 1) copies: total - original TiFlash RU + scaled TiFlash RU.
+	result.TotalRU += engineRU.TiFlash * (statementRUTiFlashMultiplier - 1)
+	// Keep the per-engine value consistent with the adjusted statement total.
+	engineRU.TiFlash *= statementRUTiFlashMultiplier
+	for _, ru := range [...]float64{result.TotalRU, engineRU.TiDB, engineRU.TiKV, engineRU.TiFlash} {
+		if ru < 0 || math.IsNaN(ru) || math.IsInf(ru, 0) {
+			return statementRUFailed(statementRUOperatorInvalid), false
+		}
+	}
+	if calculator.report != nil {
+		// Freeze full-mode details independently of the mutable accumulator.
+		report := *calculator.report
+		report.addStatementUnits(calculator.units)
+		calculator.report = &report
 	}
 	return statementRUFinalizedSnapshot{
 		units:            calculator.units,
 		result:           result,
+		engineRU:         engineRU,
+		report:           calculator.report,
 		calibrationState: statementRUCalibrationIncomplete,
-		writeSQL:         calculator.units.WriteStatement != 0 || calculator.units.WriteKeys != 0,
+		sqlType:          "select",
 	}, true
 }
 
@@ -263,58 +336,46 @@ func publishStatementRUFinalizedSnapshot(
 	stmt *ExecStmt,
 	finalized statementRUFinalizedSnapshot,
 ) {
-	reportStatementRUV3ConsumptionSafely(stmt, finalized.result.TotalRU)
+	reportStatementRUV2ConsumptionSafely(stmt, finalized.engineRU)
 	publishStatementRUMetricsSafely(finalized)
+	if finalized.report == nil {
+		return
+	}
 	publishStatementRUCalibrationSafely(stmt, statementRUCalibrationSnapshot{
 		State: finalized.calibrationState,
 		Units: finalized.units,
 	})
 }
 
-func reportStatementRUV3ConsumptionSafely(stmt *ExecStmt, totalRU float64) {
+func reportStatementRUV2ConsumptionSafely(stmt *ExecStmt, result statementRUEngineResult) {
 	defer func() {
 		_ = recover()
 	}()
-	if stmt == nil || stmt.Ctx == nil || totalRU <= 0 {
+	if stmt == nil || stmt.Ctx == nil || (result.TiDB <= 0 && result.TiKV <= 0 && result.TiFlash <= 0) {
 		return
 	}
 	dctx := stmt.Ctx.GetDistSQLCtx()
 	if dctx == nil || dctx.RUConsumptionReporter == nil || len(dctx.ResourceGroupName) == 0 {
 		return
 	}
-	// TODO: distinguish TiDB/KV/Flash RU.
-	dctx.RUConsumptionReporter.ReportRUV2Consumption(dctx.ResourceGroupName, 0, totalRU, 0)
+	dctx.RUConsumptionReporter.ReportRUV2Consumption(dctx.ResourceGroupName, result.TiKV, result.TiDB, result.TiFlash)
 }
 
-// publishStatementRUMetricsSafely projects one immutable finalized snapshot to
-// the existing RU v3 counters. ResultOnly retains aggregate CPUWork rather than
-// a site split, so publication preserves the producer-owned engine boundary:
-// TiKV receives scan, network and committed write work; Total and SQLType receive the
-// complete best-effort result.
+// publishStatementRUMetricsSafely publishes result metrics using cached counters.
+// All label lookup and calibration projections live behind the full-mode guard.
 func publishStatementRUMetricsSafely(finalized statementRUFinalizedSnapshot) {
 	defer func() {
-		_ = recover()
+		if recover() != nil && finalized.report != nil {
+			publishStatementRUFailureSafely(statementRUPanic)
+		}
 	}()
-	totalRU := finalized.result.TotalRU
-	metrics.RUV3Total.Add(totalRU)
-	sqlType := metrics.LblSQLTypeRead
-	if finalized.writeSQL {
-		sqlType = metrics.LblSQLTypeWrite
+	if finalized.ttlJob {
+		metrics.RUV2TTLTotal.Add(finalized.result.TotalRU)
 	}
-	metrics.RUV3BySQLType.WithLabelValues(sqlType).Add(totalRU)
-	weights := currentStatementRUWeights()
-	metrics.RUV3ByEngine.WithLabelValues(metrics.LblEngineTiKV).Add(
-		weights.ScanByte*finalized.units.ScanBytes +
-			weights.NetByte*finalized.units.NetBytes +
-			weights.WriteKey*finalized.units.WriteKeys +
-			weights.WriteByte*finalized.units.WriteBytes,
-	)
-	metrics.RUV3Unit.WithLabelValues(metrics.LblRUV3UnitCPUWork).Add(finalized.units.CPUWork)
-	metrics.RUV3Unit.WithLabelValues(metrics.LblRUV3UnitScanBytes).Add(finalized.units.ScanBytes)
-	metrics.RUV3Unit.WithLabelValues(metrics.LblRUV3UnitNetBytes).Add(finalized.units.NetBytes)
-	metrics.RUV3Unit.WithLabelValues(metrics.LblRUV3UnitFrontendCompileBytes).Add(finalized.units.FrontendCompileBytes)
-	metrics.RUV3Unit.WithLabelValues(metrics.LblRUV3UnitHashStateRows).Add(finalized.units.HashStateRows)
-	metrics.RUV3Unit.WithLabelValues(metrics.LblRUV3UnitJoinOutputRows).Add(finalized.units.JoinOutputRows)
+	metrics.AddRUV2Results(finalized.engineRU.TiKV, finalized.engineRU.TiDB, finalized.engineRU.TiFlash, finalized.result.TotalRU, finalized.sqlType)
+	if finalized.report != nil {
+		publishStatementRUFullMetrics(finalized)
+	}
 }
 
 func publishStatementRUCalibrationSafely(
@@ -324,9 +385,8 @@ func publishStatementRUCalibrationSafely(
 	defer func() {
 		_ = recover()
 	}()
-	// The typed calibration boundary is intentionally dormant until a later PR
-	// installs the real consumer. This failpoint only observes the same production
-	// call; it does not select a test-only calculation or publication mode.
+	// Full-mode tests observe the same terminal units as the metrics consumer.
+	// Result mode never calls this calibration-only projection.
 	connectionID := uint64(0)
 	if stmt != nil && stmt.Ctx != nil && stmt.Ctx.GetSessionVars() != nil {
 		connectionID = stmt.Ctx.GetSessionVars().ConnectionID
@@ -345,5 +405,6 @@ func publishStatementRUCalibrationSafely(
 		snapshot.Units.OperatorNum,
 		snapshot.Units.WriteKeys,
 		snapshot.Units.WriteBytes,
+		snapshot.Units.CrossAZNetBytes,
 	)
 }
